@@ -169,32 +169,51 @@ gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
 ```bash
 export APPS_SCRIPT_URL="https://script.google.com/macros/s/AKfycbyCJ5Fkyw8JySwT5G-aqWTDAtR6nN8n-Nv-PifbnOHJ4_gxkXwjWXl162Pl-Tjf3fE0/exec"
 
-curl -sS "${APPS_SCRIPT_URL}?action=getURLIndex" | jq '.pages | length'
+# The -L is required: Apps Script /exec always 302s to a
+# script.googleusercontent.com URL that returns the JSON body.
+curl -sSL "${APPS_SCRIPT_URL}?action=getURLIndex" | jq '.pages | length'
 ```
 
-A number around 60 confirms the mirror is up.
+A number around 60 confirms the mirror is up. The runtime client uses
+`httpx.AsyncClient(follow_redirects=True)`, so the service handles the
+redirect transparently.
 
 ### Troubleshooting: `jq: parse error: Invalid numeric literal`
 
-This means the Apps Script returned **non-JSON** (usually an HTML login
-redirect). Inspect what came back:
+This means **`curl` was not following the Apps Script 302 redirect**, so
+`jq` saw the redirect's HTML body instead of the JSON. The fix is the `-L`
+flag (already in the command above). If you still see the error, inspect
+the full exchange:
 
 ```bash
 curl -sSL -i "${APPS_SCRIPT_URL}?action=getURLIndex" | head -c 1500; echo
 ```
 
-| What you see in the response | Cause | Fix |
-|------------------------------|-------|-----|
-| `Location: https://accounts.google.com/...ServiceLogin` + HTML | Apps Script deployed as **Who has access: Only myself / org** | Script owner: Apps Script editor → **Deploy → Manage deployments → ✏️** → **Who has access: Anyone** |
-| `HTTP/2 200` with an HTML body containing "Apps Script" | **Execute as: User accessing the web app** but anonymous can't auth | Script owner: redeploy with **Execute as: Me** + **Who has access: Anyone** |
-| `HTTP/2 200` + "Authorization is required to perform that action" | Script's execution identity lost access to the mirror doc | Script owner opens the script editor and runs any function once to re-authorize |
+A healthy response looks like:
+
+```
+HTTP/2 302
+location: https://script.googleusercontent.com/macros/echo?...
+
+HTTP/2 200
+content-type: application/json; charset=utf-8
+...
+{"pages":[...]}
+```
+
+If the second response is **not** `application/json`, you're hitting one
+of the real Apps Script problems:
+
+| Body of the 200 response | Cause | Fix |
+|--------------------------|-------|-----|
+| HTML "Sign in to continue" / redirect to `accounts.google.com/ServiceLogin` | Apps Script deployed with **Who has access: Only myself / org** | Script owner: Apps Script editor → **Deploy → Manage deployments → ✏️** → **Who has access: Anyone** |
+| HTML mentioning "Authorization is required" | Script execution identity lost access to the mirror doc | Script owner opens the script editor and runs any function once to re-authorize |
 | `HTTP/2 404` or "Sorry, unable to open the file at this time." | Deployment was rotated → new `/exec` URL | Get the new `/exec` URL from the script owner; update `APPS_SCRIPT_URL` |
 
-If you can't fix the script immediately, you can still continue with the
-deploy by stashing a **placeholder** URL — `grace-site-mirror` will return
-`upstream_error` for every call, but the other 2 leaf services and the
-orchestrator will work, and the orchestrator's per-tier failure isolation
-will report Tier 1 as `error:` while still returning Tiers 2 and 3.
+If you can't fix the script right now, set a placeholder so the rest of
+the deploy can proceed — `grace-site-mirror` will return `upstream_error`
+on every call, and the orchestrator's per-tier failure isolation will mark
+Tier 1 as `error:` while still returning Tiers 2 and 3:
 
 ```bash
 # ONLY if the real URL isn't ready yet:
