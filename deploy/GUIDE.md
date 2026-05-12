@@ -171,12 +171,47 @@ export APPS_SCRIPT_URL="https://script.google.com/macros/s/AKfycbyCJ5Fkyw8JySwT5
 
 # The -L is required: Apps Script /exec always 302s to a
 # script.googleusercontent.com URL that returns the JSON body.
-curl -sSL "${APPS_SCRIPT_URL}?action=getURLIndex" | jq '.pages | length'
+curl -sSL "${APPS_SCRIPT_URL}?action=getURLIndex" | jq '.totalPages, (.sections | length)'
 ```
 
-A number around 60 confirms the mirror is up. The runtime client uses
+You should see `63` printed twice. The runtime client uses
 `httpx.AsyncClient(follow_redirects=True)`, so the service handles the
 redirect transparently.
+
+The live script is **SiteMirrorQuery v3** — its real response shape differs
+from the original design spec:
+
+- `getURLIndex` returns `{sections: [...]}` (not `pages`) with
+  `pageName`/`paraStart`/`paraEnd`
+- `searchSections` requires `q=` (not `query=`)
+- `getNavMap` returns `{entries: [...]}` (not a nested tree)
+- `getLinkIndex` requires `page=` (not `name=`)
+- `searchSections` auto-expands abbreviations: `SOW` → "Statement of Work",
+  `PM` → "Project Manager", `KO` → "Kickoff", `UAT`, `SIT`, `CR`, `QA`,
+  `Dev`, `SF`, `CSAT`. The expanded form comes back as `queryNormalized`.
+
+`grace-site-mirror` is already aligned with v3 — both request param names
+and response keys. No action needed on your side.
+
+### Optional but recommended: warm the v3 snapshot cache
+
+The v3 script builds a 5,937-paragraph snapshot the first time it's asked
+to do real work. To avoid the first user-facing query paying that 20-30s
+cost, the script owner should open the Apps Script editor for the
+SiteMirrorQuery project once and run the `rebuildSnapshot` function:
+
+1. Open the Apps Script project (the one whose deployment owns
+   `AKfycby...Tjf3fE0`).
+2. In the editor, choose the function `rebuildSnapshot` from the function
+   dropdown.
+3. Click **Run**. Authorize if prompted. Wait ~30 seconds for the log to
+   show `rebuildSnapshot complete`.
+
+The snapshot is then cached for 6 hours in `CacheService` and ~24 hours on
+Drive. The script's own header recommends adding a **daily time-driven
+trigger** on `rebuildSnapshot` to keep the cache fresh — the operator can
+add this via Apps Script editor → **Triggers** → "Add Trigger" →
+`rebuildSnapshot` / Time-driven / Day timer.
 
 ### Troubleshooting: `jq: parse error: Invalid numeric literal`
 
@@ -198,7 +233,7 @@ location: https://script.googleusercontent.com/macros/echo?...
 HTTP/2 200
 content-type: application/json; charset=utf-8
 ...
-{"pages":[...]}
+{"action":"getURLIndex","totalPages":63,"mirrorDocId":"...","sections":[...]}
 ```
 
 If the second response is **not** `application/json`, you're hitting one
@@ -209,6 +244,7 @@ of the real Apps Script problems:
 | HTML "Sign in to continue" / redirect to `accounts.google.com/ServiceLogin` | Apps Script deployed with **Who has access: Only myself / org** | Script owner: Apps Script editor → **Deploy → Manage deployments → ✏️** → **Who has access: Anyone** |
 | HTML mentioning "Authorization is required" | Script execution identity lost access to the mirror doc | Script owner opens the script editor and runs any function once to re-authorize |
 | `HTTP/2 404` or "Sorry, unable to open the file at this time." | Deployment was rotated → new `/exec` URL | Get the new `/exec` URL from the script owner; update `APPS_SCRIPT_URL` |
+| `{"totalPages": 0, "sections": []}` | Mirror doc is empty (not yet populated by the upstream sync) | Script owner runs whatever job populates the mirror Google Doc, then `rebuildSnapshot()` |
 
 If you can't fix the script right now, set a placeholder so the rest of
 the deploy can proceed — `grace-site-mirror` will return `upstream_error`
@@ -521,15 +557,27 @@ mcp_parse () {
 }
 ```
 
-**E2E-3 — Tier 1 canonical URLs:**
+**E2E-3 — Tier 1 canonical URLs (no internal-URL leakage):**
 
 ```bash
-mcp_call "$SITE_MIRROR_URL" site_mirror_search '{"query":"kickoff","limit":3}' \
-  | mcp_parse \
+RESP=$(mcp_call "$SITE_MIRROR_URL" site_mirror_search '{"query":"kickoff","limit":3}' | mcp_parse)
+echo "$RESP" | jq '.result.structuredContent | {status, n: (.results|length), query_normalized}'
+
+# Every siteUrl is canonical:
+echo "$RESP" \
   | jq -r '.result.structuredContent.results[].siteUrl' \
   | grep -qE '^https://sites\.google\.com/zennify\.com/delivery/' \
-  && echo PASS || echo FAIL
+  && echo "siteUrl PASS" || echo "siteUrl FAIL"
+
+# Internal URLs never leak (mirror doc ID or Apps Script prefix):
+echo "$RESP" \
+  | grep -qE '(1KIudQjWefyoQfbdKMCVahIn3DOn-YNeo0KoZfdrB990|script\.google\.com/macros/s/)' \
+  && echo "LEAK DETECTED — investigate url_canon" || echo "leak PASS"
 ```
+
+Expected: `siteUrl PASS` and `leak PASS`. Note `query_normalized` —
+the v3 script expands `KO` → "Kickoff", `SOW` → "Statement of Work", etc.,
+so a query for `SOW` will round-trip as `"Statement of Work"`.
 
 **E2E-4 — Tier 2 ZS_ priority:**
 
