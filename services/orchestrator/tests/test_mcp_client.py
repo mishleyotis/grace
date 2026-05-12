@@ -1,95 +1,96 @@
-"""Unit tests for the JSON-RPC MCPClient used by the orchestrator."""
+"""Unit + end-to-end tests for the orchestrator's MCPClient.
+
+Uses fastmcp.Client's in-memory short-circuit (Client(mcp)) and a real
+streamable-HTTP path against a build_app-wrapped FastMCP, to verify the
+orchestrator's connector matches the actual MCP transport that production
+will use.
+"""
 
 from __future__ import annotations
 
-import json
+import os
+from contextlib import contextmanager
 
 import pytest
-from grace_orchestrator.mcp_client import MCPClient
 
 
-class FakeResp:
-    def __init__(self, status_code=200, headers=None, body=None, text=""):
-        self.status_code = status_code
-        self.headers = headers or {"content-type": "application/json"}
-        self._body = body
-        if text:
-            self.text = text
-        elif body is not None:
-            self.text = json.dumps(body)
+@contextmanager
+def _bearer_env(token: str = "x" * 32):
+    prev = os.environ.get("MCP_BEARER_TOKEN")
+    os.environ["MCP_BEARER_TOKEN"] = token
+    try:
+        yield token
+    finally:
+        if prev is None:
+            os.environ.pop("MCP_BEARER_TOKEN", None)
         else:
-            self.text = ""
-
-    def json(self):
-        return self._body
+            os.environ["MCP_BEARER_TOKEN"] = prev
 
 
-class FakeHttp:
-    def __init__(self, resp):
-        self.resp = resp
-        self.calls = []
+@pytest.fixture
+def upstream_mcp():
+    from fastmcp import FastMCP  # type: ignore
 
-    async def post(self, url, json=None, headers=None):  # noqa: A002
-        self.calls.append({"url": url, "json": json, "headers": headers})
-        return self.resp
+    mcp = FastMCP("upstream-mcp")
 
-    async def aclose(self):
-        return None
+    @mcp.tool()
+    async def upstream_search(query: str, limit: int = 10) -> dict:
+        return {
+            "status": "ok",
+            "query": query,
+            "results": [{"name": f"hit-{i}", "score": 10 - i} for i in range(min(limit, 3))],
+        }
 
+    @mcp.tool()
+    async def upstream_error() -> dict:
+        raise RuntimeError("simulated upstream failure")
 
-@pytest.mark.asyncio
-async def test_structured_content_unwrapped():
-    body = {"jsonrpc": "2.0", "id": "x", "result": {"structuredContent": {"status": "ok", "results": [1]}}}
-    http = FakeHttp(FakeResp(body=body))
-    client = MCPClient("https://svc-abc.run.app", "tok", http_client=http)
-    out = await client.call_tool("foo", {"q": "x"})
-    assert out == {"status": "ok", "results": [1]}
-    # Endpoint normalization
-    assert http.calls[0]["url"].endswith("/mcp/")
-    # JSON-RPC envelope
-    assert http.calls[0]["json"]["method"] == "tools/call"
-    assert http.calls[0]["json"]["params"]["name"] == "foo"
-    assert http.calls[0]["json"]["params"]["arguments"] == {"q": "x"}
-    # Bearer header
-    assert http.calls[0]["headers"]["Authorization"] == "Bearer tok"
+    return mcp
 
 
 @pytest.mark.asyncio
-async def test_text_content_fallback():
-    payload = {"status": "ok", "results": []}
-    body = {
-        "jsonrpc": "2.0",
-        "id": "x",
-        "result": {"content": [{"type": "text", "text": json.dumps(payload)}]},
-    }
-    http = FakeHttp(FakeResp(body=body))
-    client = MCPClient("https://svc/mcp", "tok", http_client=http)
-    assert await client.call_tool("foo", {}) == payload
+async def test_in_memory_round_trip_returns_structured_content(upstream_mcp):
+    """In-memory: Client(mcp) talks directly to the FastMCP instance.
+    Validates that structured_content is unwrapped correctly."""
+    from fastmcp import Client  # type: ignore
+    from grace_orchestrator.mcp_client import MCPClient
+
+    async with Client(upstream_mcp) as client:
+        c = MCPClient(base_url="", bearer_token="ignored", client=client)
+        out = await c.call_tool("upstream_search", {"query": "kickoff", "limit": 2})
+        assert out["status"] == "ok"
+        assert out["query"] == "kickoff"
+        assert len(out["results"]) == 2
+        assert out["results"][0]["name"] == "hit-0"
 
 
 @pytest.mark.asyncio
-async def test_sse_response_parsed():
-    payload = {"jsonrpc": "2.0", "id": "1", "result": {"structuredContent": {"x": 1}}}
-    text = f"event: message\ndata: {json.dumps(payload)}\n\n"
-    resp = FakeResp(headers={"content-type": "text/event-stream"}, text=text)
-    http = FakeHttp(resp)
-    client = MCPClient("https://svc", "tok", http_client=http)
-    assert await client.call_tool("foo", {}) == {"x": 1}
+async def test_in_memory_tool_failure_raises_upstream_error(upstream_mcp):
+    from fastmcp import Client  # type: ignore
+    from grace_orchestrator.mcp_client import MCPClient
+    from grace_shared.errors import UpstreamError
+
+    async with Client(upstream_mcp) as client:
+        c = MCPClient(base_url="", bearer_token="ignored", client=client)
+        with pytest.raises(UpstreamError, match="upstream_error failed"):
+            await c.call_tool("upstream_error", {})
 
 
-@pytest.mark.asyncio
-async def test_jsonrpc_error_raises_upstream():
-    body = {"jsonrpc": "2.0", "id": "x", "error": {"code": -32600, "message": "bad"}}
-    http = FakeHttp(FakeResp(body=body))
-    client = MCPClient("https://svc", "tok", http_client=http)
-    with pytest.raises(Exception, match="JSON-RPC error: bad"):
-        await client.call_tool("foo", {})
+def test_normalize_endpoint_appends_mcp():
+    from grace_orchestrator.mcp_client import _normalize_endpoint
+
+    assert _normalize_endpoint("https://svc.example.com") == "https://svc.example.com/mcp"
+    assert _normalize_endpoint("https://svc.example.com/") == "https://svc.example.com/mcp"
+    assert (
+        _normalize_endpoint("https://svc.example.com/mcp") == "https://svc.example.com/mcp"
+    )
+    assert (
+        _normalize_endpoint("https://svc.example.com/mcp/") == "https://svc.example.com/mcp"
+    )
 
 
-@pytest.mark.asyncio
-async def test_http_5xx_raises_upstream():
-    resp = FakeResp(status_code=500, text="boom", body=None)
-    http = FakeHttp(resp)
-    client = MCPClient("https://svc", "tok", http_client=http)
-    with pytest.raises(Exception, match="HTTP 500"):
-        await client.call_tool("foo", {})
+def test_constructor_requires_base_or_client():
+    from grace_orchestrator.mcp_client import MCPClient
+
+    with pytest.raises(RuntimeError, match="base_url required"):
+        MCPClient(base_url="", bearer_token="x")

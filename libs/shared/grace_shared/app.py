@@ -120,32 +120,40 @@ def build_healthz(service_name: str) -> Callable[..., Awaitable[Any]]:
 
 
 def build_app(mcp: Any, *, name: str, config: ServiceConfig) -> Any:
-    """Wrap a FastMCP instance into a Starlette ASGI app with auth + healthz + logging.
+    """Wrap a FastMCP instance into an ASGI app with bearer auth + healthz + access log.
 
-    FastMCP's ``http_app()`` mounts its JSON-RPC handler at ``/mcp/`` inside
-    its own ASGI tree by default. We mount that app at the **root** of our
-    outer Starlette app so the external URL is also ``/mcp/`` — not
-    ``/mcp/mcp/``. ``/healthz`` is registered as a sibling route ahead of
-    the mount so it always wins for that exact path.
+    Strategy: register ``/healthz`` directly on the FastMCP instance via
+    ``custom_route``, then return ``mcp.http_app()`` as the base ASGI app —
+    no outer Starlette wrapper. FastMCP's app already has its lifespan,
+    routing, and ``/mcp`` transport mount wired correctly; wrapping it in
+    another Starlette breaks the MCP route because ``http_app()`` returns
+    a top-level Starlette and double-mounting changes the routing tree.
+
+    External URLs:
+      - ``GET /healthz`` → 200 ``{"status":"ok","service":"<name>"}``
+      - ``POST /mcp`` and ``POST /mcp/`` → MCP JSON-RPC (bearer required)
     """
-    from starlette.applications import Starlette  # type: ignore
-    from starlette.routing import Mount, Route  # type: ignore
+    from starlette.responses import JSONResponse  # type: ignore
 
     logging.basicConfig(
         level=getattr(logging, config.log_level, logging.INFO),
         format="%(message)s",
     )
 
-    if hasattr(mcp, "http_app"):
-        mcp_app = mcp.http_app()
-    else:
-        mcp_app = mcp.streamable_http_app()
+    # Register /healthz on the FastMCP instance. Must happen before http_app().
+    if hasattr(mcp, "custom_route"):
 
-    routes = [
-        Route("/healthz", build_healthz(name)),
-        Mount("/", app=mcp_app),
-    ]
-    app = Starlette(routes=routes, lifespan=getattr(mcp_app, "lifespan", None))
+        @mcp.custom_route("/healthz", methods=["GET"])
+        async def _healthz(_request: Any) -> Any:
+            return JSONResponse({"status": "ok", "service": name})
+
+    # Materialize the ASGI app — Starlette under the hood with FastMCP's
+    # routes + lifespan + any custom_route handlers.
+    if hasattr(mcp, "http_app"):
+        app = mcp.http_app()
+    else:
+        app = mcp.streamable_http_app()  # very-old FastMCP fallback
+
     app = BearerAuthMiddleware(app, expected_token=config.bearer_token, service=name)
     app = AccessLogMiddleware(app, service=name)
     return app
