@@ -281,16 +281,42 @@ resource):
 | Onboarding Tracker (`197CSSit_xi872N8oF3_uhV-LYxvRQwA42rfkknLCgEc`) | **Editor** | `$RUNTIME_SA` |
 | ZennSource shared Drive (`0AGq-3ZBpQU5MUk9PVA`) | **Viewer** (drive-level member) | `$RUNTIME_SA` |
 
-Verify after sharing (your own ADC creds are fine for this check):
+### Verify the share (optional — impersonates the runtime SA)
+
+The share will be exercised end-to-end by smoke tests E2E-4 and E2E-5 in
+step 11, so this verify is optional. It just gives you a "fail fast"
+signal that the Workspace share went through.
+
+**Do not** use `gcloud auth application-default` for this — Cloud Shell's
+default ADC token does not include the Drive scope, and Google now blocks
+the `drive` scope for the default ADC client. Use **service-account
+impersonation** instead, which also proves the *runtime SA* (not just
+your user) can read the resource:
 
 ```bash
-gcloud auth application-default print-access-token \
-  | xargs -I {} curl -sS -H "Authorization: Bearer {}" \
-    "https://www.googleapis.com/drive/v3/files/19VQxsUb7pnnxTWP0vQzLLjIZWKU3k382lOEVYSnyiKE?fields=id,name&supportsAllDrives=true"
+# One-time: grant yourself Token Creator on the runtime SA.
+ME=$(gcloud config get-value account)
+gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
+  --member="user:${ME}" \
+  --role="roles/iam.serviceAccountTokenCreator" \
+  --project="$GCP_PROJECT"
+
+# Mint a token AS the runtime SA, with the Drive read scope.
+TOKEN=$(gcloud auth print-access-token \
+  --impersonate-service-account="$RUNTIME_SA" \
+  --scopes="https://www.googleapis.com/auth/drive.readonly")
+
+# Hit Drive directly as the runtime SA.
+curl -sS \
+  -H "Authorization: Bearer $TOKEN" \
+  "https://www.googleapis.com/drive/v3/files/19VQxsUb7pnnxTWP0vQzLLjIZWKU3k382lOEVYSnyiKE?fields=id,name&supportsAllDrives=true"
 ```
 
 Expect a JSON body with the file's `id` and `name`. 403/404 means the
 share hasn't propagated yet — wait ~60 s and retry.
+
+If you'd rather not deal with this, **skip it and proceed to step 6** —
+the smoke tests will surface any sharing gap.
 
 ---
 
@@ -793,6 +819,8 @@ gcloud iam service-accounts delete "$RUNTIME_SA" \
 | Orchestrator returns `error: UpstreamError` for one tier | Tier URL env var missing | `gcloud run services describe grace-orchestrator` and inspect `SITE_MIRROR_URL` / `SHEETS_URL` / `SLACK_URL`; redeploy with `--update-env-vars` if needed |
 | Image runs on M1/M2 Mac but crashes on Cloud Run | ARM image pushed | Re-build with `DOCKER_DEFAULT_PLATFORM=linux/amd64` |
 | MCP smoke calls return `text/event-stream` and `jq` fails | SSE response, not JSON | Pipe through `mcp_parse` from step 11 |
+| Step-5 verify: `requires a quota project` or `Insufficient Permission` | Cloud Shell ADC has no Drive scope; Google now blocks the `drive` scope for the default ADC client | Use SA impersonation (step 5's "Verify the share" block), or skip the verify and rely on step 11's smoke tests |
+| Step-5 verify: `iam.serviceAccounts.getAccessToken denied` when impersonating | Your user lacks `roles/iam.serviceAccountTokenCreator` on `$RUNTIME_SA` | `gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" --member="user:$ME" --role=roles/iam.serviceAccountTokenCreator` |
 | Internal URL leaks into any response | Bug — file a P0 | `url_canon.py` is supposed to scrub; check `grace_shared.url_canon` and the Site Mirror tools |
 | `gcloud beta billing projects describe` shows `billingEnabled=False` | Project lost its billing link | Re-link a billing account before continuing |
 
