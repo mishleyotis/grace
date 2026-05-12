@@ -411,6 +411,7 @@ Run from the **repo root** (`grace-pmo-mcp/`):
 
 ```bash
 cd /path/to/grace-pmo-mcp
+git pull   # make sure you have the latest site-mirror fixes
 
 for svc in site-mirror sheets slack orchestrator; do
   echo "==== Building grace-${svc}:${IMAGE_TAG} ===="
@@ -419,9 +420,35 @@ for svc in site-mirror sheets slack orchestrator; do
     -t "${REGISTRY}/grace-${svc}:${IMAGE_TAG}" \
     -t "${REGISTRY}/grace-${svc}:latest" \
     .
-  docker push "${REGISTRY}/grace-${svc}:${IMAGE_TAG}"
-  docker push "${REGISTRY}/grace-${svc}:latest"
+
+  # Retry on transient network failures (Cloud Shell occasionally drops
+  # connections to *-docker.pkg.dev mid-blob). Both tags must push.
+  pushed=0
+  for attempt in 1 2 3 4; do
+    if docker push "${REGISTRY}/grace-${svc}:${IMAGE_TAG}" \
+       && docker push "${REGISTRY}/grace-${svc}:latest"; then
+      pushed=1
+      break
+    fi
+    sleep $((attempt * attempt * 2))   # 2s, 8s, 18s, 32s
+  done
+  if [ "$pushed" != "1" ]; then
+    echo "FATAL: grace-${svc} push failed after 4 attempts" >&2
+    exit 1
+  fi
 done
+```
+
+After the loop, verify all four images landed with both tags:
+
+```bash
+for svc in site-mirror sheets slack orchestrator; do
+  echo "=== grace-${svc} ==="
+  gcloud artifacts docker tags list \
+    "${REGISTRY}/grace-${svc}" --project="$GCP_PROJECT" --format='value(TAG)' \
+    | head -3
+done
+# Expect `latest` and `<IMAGE_TAG>` for each service.
 ```
 
 > Each Dockerfile reads `pyproject.toml`, `libs/shared/`, and its own
@@ -814,6 +841,7 @@ gcloud iam service-accounts delete "$RUNTIME_SA" \
 | `grace-slack` returns `no_results` + `warning: AUTHORITATIVE_SLACK_USER_IDS env var not set` | Secret value empty or service not redeployed with the new version | Re-add the secret + `ROTATION_NONCE` update |
 | `grace-site-mirror` returns `upstream_error: request failed` | Apps Script URL wrong or rate-limited | Re-check step 4 |
 | Cloud Run service stuck "Provisioning" | Image tag not in Artifact Registry | Re-run `docker push` from step 8 |
+| `gcloud run deploy` ERROR: `Image '...:<TAG>' not found` | `docker push` failed silently mid-loop (transient `connection refused` to `*-docker.pkg.dev`) | `gcloud artifacts docker tags list ${REGISTRY}/grace-<svc>` to see what's actually there; re-push with the retry loop in step 8; if `:latest` is present but the SHA tag isn't, `docker tag ${REGISTRY}/grace-<svc>:latest ${REGISTRY}/grace-<svc>:${IMAGE_TAG}` then push |
 | `gcloud run deploy` fails with `PERMISSION_DENIED` on secret | Runtime SA missing `secretmanager.secretAccessor` | Re-do step 3 |
 | `gcloud run deploy` fails with `iam.serviceAccountUser` denied | Your gcloud principal can't act as `$RUNTIME_SA` | Re-run the `add-iam-policy-binding` at the end of step 3 |
 | Orchestrator returns `error: UpstreamError` for one tier | Tier URL env var missing | `gcloud run services describe grace-orchestrator` and inspect `SITE_MIRROR_URL` / `SHEETS_URL` / `SLACK_URL`; redeploy with `--update-env-vars` if needed |
