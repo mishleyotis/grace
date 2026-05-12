@@ -1,0 +1,57 @@
+[project]
+name = "grace-pmo-mcp"
+version = "1.0.0"
+description = "Grace PMO Assistant — 4 MCP services + shared library"
+requires-python = ">=3.12"
+
+[tool.uv.workspace]
+members = [
+  "libs/shared",
+  "services/site-mirror",
+  "services/sheets",
+  "services/slack",
+  "services/orchestrator",
+]
+
+[tool.uv.sources]
+grace-shared = { workspace = true }
+grace-site-mirror = { workspace = true }
+grace-sheets = { workspace = true }
+grace-slack = { workspace = true }
+grace-orchestrator = { workspace = true }
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "pytest-mock>=3.12",
+  "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = [
+  "libs/shared/tests",
+  "services/site-mirror/tests",
+  "services/sheets/tests",
+  "services/slack/tests",
+  "services/orchestrator/tests",
+]
+addopts = "--import-mode=importlib"
+pythonpath = [
+  "services/site-mirror/tests",
+  "services/sheets/tests",
+  "services/slack/tests",
+  "services/orchestrator/tests",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = ["E501", "B008"]

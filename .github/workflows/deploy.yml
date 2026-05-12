@@ -1,0 +1,97 @@
+name: test-build-deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-packages
+      - name: Lint
+        run: uv run ruff check .
+      - name: Unit tests
+        run: uv run pytest -q
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - site-mirror
+          - sheets
+          - slack
+          - orchestrator
+    env:
+      GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      WIF_PROVIDER: ${{ vars.WIF_PROVIDER }}
+      DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
+      ARTIFACT_REGISTRY: ${{ vars.ARTIFACT_REGISTRY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build image
+        run: |
+          docker build \
+            -f services/${{ matrix.service }}/Dockerfile \
+            -t "$ARTIFACT_REGISTRY/grace-${{ matrix.service }}:${GITHUB_SHA}" \
+            -t "$ARTIFACT_REGISTRY/grace-${{ matrix.service }}:latest" \
+            .
+
+      - name: Push image
+        run: |
+          docker push "$ARTIFACT_REGISTRY/grace-${{ matrix.service }}:${GITHUB_SHA}"
+          docker push "$ARTIFACT_REGISTRY/grace-${{ matrix.service }}:latest"
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "grace-${{ matrix.service }}" \
+            --image "$ARTIFACT_REGISTRY/grace-${{ matrix.service }}:${GITHUB_SHA}" \
+            --region "$GCP_REGION" \
+            --project "$GCP_PROJECT" \
+            --quiet
+
+      - name: Smoke-test /healthz
+        run: |
+          URL=$(gcloud run services describe "grace-${{ matrix.service }}" \
+            --region "$GCP_REGION" --project "$GCP_PROJECT" --format='value(status.url)')
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL/healthz")
+            if [ "$code" = "200" ]; then
+              echo "OK: $URL/healthz returned 200"
+              exit 0
+            fi
+            echo "attempt $i: $code; sleeping"
+            sleep 5
+          done
+          echo "Health check failed" >&2
+          exit 1

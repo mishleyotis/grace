@@ -1,0 +1,17 @@
+[project]
+name = "grace-shared"
+version = "1.0.0"
+description = "Shared library — app builder, auth, errors, URL canonicalization"
+requires-python = ">=3.12"
+dependencies = [
+  "fastmcp>=0.4.0",
+  "starlette>=0.40",
+  "uvicorn>=0.30",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["grace_shared"]
