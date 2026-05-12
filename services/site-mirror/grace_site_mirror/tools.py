@@ -108,7 +108,11 @@ async def site_mirror_get_section(client: AppsScriptClient, name: str) -> dict:
     if not isinstance(data, dict):
         return to_error_dict(ValidationError("unexpected response shape"))
     if data.get("status") == "no_results" or data.get("error"):
-        return {"status": "no_results", "name": name}
+        out: dict = {"status": "no_results", "name": name}
+        sug = data.get("suggestions")
+        if isinstance(sug, list) and sug:
+            out["suggestions"] = sug
+        return out
     site_url = _safe_str(data.get("siteUrl"))
     content = (
         _safe_str(data.get("content"))
@@ -122,6 +126,12 @@ async def site_mirror_get_section(client: AppsScriptClient, name: str) -> dict:
         "name": _safe_str(data.get("name")) or _safe_str(data.get("pageName")) or name,
         "content": content,
         "paragraphs": paragraphs if isinstance(paragraphs, list) else [],
+        # Live script extras (pass through when present, omit otherwise)
+        **(
+            {"page_structure": data["pageStructure"]}
+            if isinstance(data.get("pageStructure"), list)
+            else {}
+        ),
     }
 
 
@@ -149,7 +159,13 @@ async def site_mirror_search(
     results = _scrub_results_list(results_in)[:limit]
     if not results:
         return {"status": "no_results", "query": query}
-    return {"status": "ok", "query": query, "results": results}
+    out: dict = {"status": "ok", "query": query, "results": results}
+    # Surface the script's query normalization (it expands SOW->Statement of
+    # Work etc.) so the Skill can show what was actually searched.
+    qn = _safe_str(data.get("queryNormalized"))
+    if qn and qn != query:
+        out["query_normalized"] = qn
+    return out
 
 
 async def site_mirror_get_url_index(client: AppsScriptClient) -> dict:
@@ -171,6 +187,22 @@ async def site_mirror_get_nav_map(client: AppsScriptClient) -> dict:
         return to_error_dict(exc)
     if not isinstance(data, dict):
         return to_error_dict(ValidationError("unexpected response shape"))
+    # Real script returns `entries: [{text, siteUrl}]` (a flat list).
+    # Design spec assumed a nested `nav` tree. Accept either.
+    if isinstance(data.get("entries"), list):
+        entries = []
+        for it in data["entries"]:
+            if not isinstance(it, dict):
+                continue
+            entries.append(
+                {
+                    "text": _safe_str(it.get("text")),
+                    "siteUrl": canonicalize_zennify_url(
+                        _safe_str(it.get("siteUrl")), _safe_str(it.get("siteUrl"))
+                    ),
+                }
+            )
+        return {"status": "ok", "entries": entries}
     nav = data.get("nav") or data.get("navMap") or data.get("tree")
     return {"status": "ok", "nav": _scrub_nav(nav)}
 
@@ -192,12 +224,21 @@ def _scrub_nav(node: Any) -> Any:
 async def site_mirror_get_page_links(client: AppsScriptClient, page_name: str) -> dict:
     if not isinstance(page_name, str) or not page_name.strip():
         return to_error_dict(ValidationError("page_name is required"))
+    # Real script requires `page=`; design spec used `name=`. Send both.
     try:
-        data = await client.call("getLinkIndex", {"name": page_name})
+        data = await client.call(
+            "getLinkIndex", {"page": page_name, "name": page_name}
+        )
     except GraceError as exc:
         return to_error_dict(exc)
     if not isinstance(data, dict):
         return to_error_dict(ValidationError("unexpected response shape"))
+    if data.get("error"):
+        return {
+            "status": "no_results",
+            "page_name": page_name,
+            "warning": _safe_str(data.get("error")),
+        }
     links_in = _pick_array(data, "links", "results")
     links = _scrub_links_list(links_in)
     return {"status": "ok", "page_name": page_name, "links": links}

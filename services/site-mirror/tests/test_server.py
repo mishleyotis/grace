@@ -309,3 +309,137 @@ async def test_search_handles_apps_script_error_envelope():
     out = await tools.site_mirror_search(c, "anything", 5)
     assert out["status"] == "no_results"
     assert "Missing required parameter" in out["warning"]
+
+
+# ---------------------------------------------------------------------------
+# Live SiteMirrorQuery v3 — additional response-shape compatibility
+# (getNavMap returns `entries`, getLinkIndex requires `page=`,
+# searchSections returns `queryNormalized`, getSection returns
+# `pageStructure` and error+suggestions).
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_get_nav_map_real_shape_with_entries():
+    body = {
+        "action": "getNavMap",
+        "description": "Full site navigation hierarchy with all page URLs",
+        "mirrorDocId": MIRROR_DOC_ID,
+        "total": 2,
+        "entries": [
+            {
+                "text": "Home → ",
+                "siteUrl": "https://sites.google.com/zennify.com/delivery/home",
+            },
+            {
+                "text": "Account Management",
+                "siteUrl": "https://sites.google.com/zennify.com/delivery/home/account-management",
+            },
+        ],
+    }
+    c = _client(lambda _u, _p: json_response(body))
+    out = await tools.site_mirror_get_nav_map(c)
+    assert out["status"] == "ok"
+    assert "entries" in out
+    assert len(out["entries"]) == 2
+    assert out["entries"][0]["text"] == "Home → "
+    # mirrorDocId never appears anywhere in the serialized output
+    assert MIRROR_DOC_ID not in json.dumps(out)
+
+
+@pytest.mark.asyncio
+async def test_get_page_links_sends_page_parameter():
+    """The live script requires `page=`; the design spec used `name=`.
+    We send both for forward/back compatibility."""
+    captured = {}
+
+    def handler(_url, params):
+        captured.update(params)
+        return json_response(
+            {
+                "action": "getLinkIndex",
+                "pageName": "Kickoff",
+                "total": 1,
+                "links": [
+                    {
+                        "label": "Project Charter",
+                        "url": "https://drive.google.com/file/d/abc/view",
+                        "type": "external",
+                    },
+                ],
+            }
+        )
+
+    c = _client(handler)
+    out = await tools.site_mirror_get_page_links(c, "Kickoff")
+    assert out["status"] == "ok"
+    assert captured.get("page") == "Kickoff"
+    assert captured.get("name") == "Kickoff"  # back-compat
+    assert len(out["links"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_page_links_error_envelope_maps_to_no_results():
+    """`{error: ..., hint: ...}` → no_results with warning."""
+    c = _client(
+        lambda _u, _p: json_response({"error": "No link index for: Bogus", "hint": "..."})
+    )
+    out = await tools.site_mirror_get_page_links(c, "Bogus")
+    assert out["status"] == "no_results"
+    assert "No link index" in out["warning"]
+
+
+@pytest.mark.asyncio
+async def test_search_surfaces_query_normalized():
+    """The live script auto-expands SOW → 'Statement of Work'; we surface that
+    so the Skill can show the user what was actually searched."""
+    body = {
+        "action": "searchSections",
+        "query": "SOW process",
+        "queryNormalized": "Statement of Work process",
+        "total": 1,
+        "results": [
+            {
+                "pageName": "SOW",
+                "siteUrl": "https://sites.google.com/zennify.com/delivery/sow",
+                "snippet": "...",
+                "matchedIn": "title",
+                "score": 25,
+            }
+        ],
+    }
+    c = _client(lambda _u, _p: json_response(body))
+    out = await tools.site_mirror_search(c, "SOW process", 5)
+    assert out["status"] == "ok"
+    assert out["query_normalized"] == "Statement of Work process"
+
+
+@pytest.mark.asyncio
+async def test_get_section_passes_through_page_structure():
+    body = {
+        "action": "getSection",
+        "pageName": "1.1 Sales Handoff",
+        "siteUrl": "https://sites.google.com/zennify.com/delivery/home/project-implementation/1-0-initiate/1-1-sales-handoff",
+        "sitePath": "/home/project-implementation/1-0-initiate/1-1-sales-handoff",
+        "paraStart": 5418,
+        "paraEnd": 5424,
+        "pageStructure": ["H1: Sales Handoff", "H2: Inputs", "H3: Process"],
+        "content": "Body paragraph one.\n\nBody paragraph two.",
+    }
+    c = _client(lambda _u, _p: json_response(body))
+    out = await tools.site_mirror_get_section(c, "1.1 Sales Handoff")
+    assert out["status"] == "ok"
+    assert out["page_structure"] == ["H1: Sales Handoff", "H2: Inputs", "H3: Process"]
+    assert "Body paragraph one." in out["content"]
+
+
+@pytest.mark.asyncio
+async def test_get_section_error_envelope_returns_suggestions():
+    body = {
+        "error": "No section matching: kikoff",
+        "suggestions": ["Kickoff  (/home/project-implementation/1-0-initiate)"],
+    }
+    c = _client(lambda _u, _p: json_response(body))
+    out = await tools.site_mirror_get_section(c, "kikoff")
+    assert out["status"] == "no_results"
+    assert out["suggestions"] == [
+        "Kickoff  (/home/project-implementation/1-0-initiate)"
+    ]
