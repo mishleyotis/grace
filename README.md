@@ -38,7 +38,11 @@ grace-pmo-mcp/
 
 ## Deployment
 
-See `deploy/GUIDE.md` for the full step-by-step (≈60 minutes end to end).
+`deploy/GUIDE.md` is the full step-by-step (~45 min of operator work).
+The default path is **CLI-only via `gcloud` + `docker`** — no Terraform or
+GitHub Actions required. The Terraform module in `infra/terraform/` and
+the workflow in `.github/workflows/deploy.yml` are equivalent IaC for
+operators who prefer that path.
 
 ## Design
 

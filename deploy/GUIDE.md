@@ -1,11 +1,22 @@
-# Grace — Deployment Guide
+# Grace — Deployment Guide (Cloud Run via bash/CLI)
 
-End-to-end deployment instructions for the four Grace MCP services and the
-`grace-pmo-director` Skill bundle. Estimated total time: **~60 minutes**.
+End-to-end deployment of the four Grace MCP services and the
+`grace-pmo-director` Skill using **only `gcloud` and `docker` on your
+shell**. No Terraform, no GitHub Actions, no Workload Identity Federation
+required for this path. Estimated total time: **~45 minutes** of operator
+work plus image-build time.
 
-> Operator pre-reqs: a Google Cloud account with billing, Workspace admin
-> rights to grant Drive and Slack scopes, a GitHub account with admin on
-> the target repo, and an Anthropic Claude account.
+> Pre-reqs: a GCP account with billing enabled and project-owner rights,
+> Workspace admin to share Drive/Sheets resources, Slack workspace admin
+> to install a bot app, an Anthropic Claude account.
+>
+> Tools on your workstation: `gcloud` (>=470), `docker` (>=24), `openssl`,
+> `curl`, `jq`. Optional: `uv` if you want to re-run the test suite.
+
+> **Need IaC instead?** `infra/terraform/` is the equivalent Terraform
+> module; `.github/workflows/deploy.yml` runs the same steps via WIF.
+> This guide is the **manual CLI alternative** for one-shot deploys or
+> environments where you don't want to set up WIF.
 
 ---
 
@@ -13,69 +24,130 @@ End-to-end deployment instructions for the four Grace MCP services and the
 
 | # | Step | Time |
 |---|------|------|
-| 1 | Provision GCP project + link billing | 5 min |
-| 2 | Verify the SiteMirrorQuery Apps Script responds | 1 min |
-| 3 | Clone the repo and run tests locally | 5 min |
-| 4 | `terraform init && terraform apply` | 5 min |
-| 5 | Share Workspace resources with the runtime SA | 5 min |
-| 6 | Create Slack bot, install, look up 6 user IDs | 10 min |
-| 7 | Populate 4 secrets via `gcloud secrets versions add` | 5 min |
-| 8 | Configure GitHub Actions variables and push to `main` | 5 min |
-| 9 | Smoke-test each service (7 checks) | 10 min |
-| 10 | Wire the 4 MCP URLs into the Anthropic project, upload the Skill | 5 min |
+| 0 | Set shell variables | 1 min |
+| 1 | Create the GCP project + link billing | 5 min |
+| 2 | Enable required APIs | 1 min |
+| 3 | Create the Artifact Registry repo | 1 min |
+| 4 | Create the runtime service account | 2 min |
+| 5 | Verify the SiteMirrorQuery Apps Script | 1 min |
+| 6 | Share Drive Map, Tracker, ZennSource Drive with the runtime SA | 5 min |
+| 7 | Create the Slack bot and look up the 6 user IDs | 10 min |
+| 8 | Create + populate the 4 secrets | 4 min |
+| 9 | Build + push the 4 images | 8 min |
+| 10 | Deploy `grace-site-mirror`, `grace-sheets`, `grace-slack` | 4 min |
+| 11 | Deploy `grace-orchestrator` (it needs the other 3 URLs) | 2 min |
+| 12 | Run the 7 smoke tests | 5 min |
+| 13 | Build + upload the Skill, wire MCPs in the Claude project | 5 min |
 
 ---
 
-## Step 0 — Tooling
+## Step 0 — Shell variables
 
-Install on your workstation:
+Set these once and keep your shell open through the whole deploy. **Edit
+the values to match your environment.**
 
 ```bash
-# uv (the Python workspace manager)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# ──── Required: customize ─────────────────────────────────────────────
+export GCP_PROJECT="grace-pmo-prod"                # your project ID
+export BILLING_ACCOUNT_ID="XXXXXX-XXXXXX-XXXXXX"   # your billing account
+export GCP_REGION="us-central1"
 
-# Terraform 1.6+
-brew install terraform           # macOS
-# OR
-apt-get install -y terraform     # Ubuntu
+# ──── Defaults: usually fine ──────────────────────────────────────────
+export AR_REPO="grace-mcp"
+export RUNTIME_SA_NAME="grace-mcp-runtime"
+export RUNTIME_SA="${RUNTIME_SA_NAME}@${GCP_PROJECT}.iam.gserviceaccount.com"
+export REGISTRY="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${AR_REPO}"
+export IMAGE_TAG="$(date +%Y%m%d-%H%M%S)"           # bump on each redeploy
+```
 
-# Google Cloud SDK
-brew install --cask google-cloud-sdk  # macOS
+Quick sanity check:
+
+```bash
 gcloud auth login
-```
-
-Confirm versions:
-
-```bash
-uv --version          # >= 0.4
-terraform --version   # >= 1.6
-gcloud --version
-```
-
----
-
-## Step 1 — GCP project + billing
-
-```bash
-export GCP_PROJECT=grace-pmo-prod          # or your chosen ID
-export GCP_REGION=us-central1
-export BILLING_ACCOUNT_ID=XXXXXX-XXXXXX-XXXXXX
-
-gcloud projects create "$GCP_PROJECT" --name="Grace PMO"
-gcloud beta billing projects link "$GCP_PROJECT" \
-  --billing-account="$BILLING_ACCOUNT_ID"
+gcloud auth application-default login   # one-time, for Drive/Sheets API tests
 gcloud config set project "$GCP_PROJECT"
 ```
 
-Terraform's `google_project_service` resources enable the required APIs
-in step 4 — no manual `gcloud services enable` calls needed.
+---
+
+## Step 1 — Project + billing
+
+```bash
+# Create the project if it doesn't exist (skip if pre-existing).
+gcloud projects create "$GCP_PROJECT" --name="Grace PMO" || true
+
+# Link billing.
+gcloud beta billing projects link "$GCP_PROJECT" \
+  --billing-account="$BILLING_ACCOUNT_ID"
+
+gcloud config set project "$GCP_PROJECT"
+```
 
 ---
 
-## Step 2 — Verify the SiteMirrorQuery Apps Script
+## Step 2 — Enable the required APIs
 
-This Apps Script Web App pre-exists (it is owned by the PMO). Confirm it
-still answers before you start:
+```bash
+gcloud services enable \
+  run.googleapis.com \
+  artifactregistry.googleapis.com \
+  secretmanager.googleapis.com \
+  iamcredentials.googleapis.com \
+  iam.googleapis.com \
+  logging.googleapis.com \
+  monitoring.googleapis.com \
+  sheets.googleapis.com \
+  drive.googleapis.com \
+  --project="$GCP_PROJECT"
+```
+
+This takes ~30 seconds to fully propagate.
+
+---
+
+## Step 3 — Create the Artifact Registry repo
+
+```bash
+gcloud artifacts repositories create "$AR_REPO" \
+  --repository-format=docker \
+  --location="$GCP_REGION" \
+  --description="Grace MCP service images" \
+  --project="$GCP_PROJECT"
+
+# Configure docker to authenticate against this registry.
+gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+```
+
+---
+
+## Step 4 — Runtime service account
+
+All 4 Cloud Run services run as this single SA. It needs:
+
+- `roles/secretmanager.secretAccessor` (project-wide; reads the 4 secrets)
+- Workspace Viewer on Drive Map / ZennSource Drive (granted in step 6)
+- Workspace Editor on the Onboarding Tracker (granted in step 6)
+
+```bash
+gcloud iam service-accounts create "$RUNTIME_SA_NAME" \
+  --display-name="Grace MCP runtime" \
+  --project="$GCP_PROJECT"
+
+gcloud projects add-iam-policy-binding "$GCP_PROJECT" \
+  --member="serviceAccount:${RUNTIME_SA}" \
+  --role="roles/secretmanager.secretAccessor" \
+  --condition=None
+```
+
+Print the email so you can paste it into the Workspace UI later:
+
+```bash
+echo "Share Drive/Tracker resources with: $RUNTIME_SA"
+```
+
+---
+
+## Step 5 — Verify the SiteMirrorQuery Apps Script
 
 ```bash
 curl -sS \
@@ -83,107 +155,54 @@ curl -sS \
   | jq '.pages | length'
 ```
 
-A number around 60 confirms the mirror is up. **Save this URL — you will
-load it into Secret Manager in step 7.**
+A number around 60 confirms the mirror is up. **Copy this URL** — you will
+store it in Secret Manager in step 8.
+
+```bash
+export APPS_SCRIPT_URL="https://script.google.com/macros/s/AKfycbyCJ5Fkyw8JySwT5G-aqWTDAtR6nN8n-Nv-PifbnOHJ4_gxkXwjWXl162Pl-Tjf3fE0/exec"
+```
 
 ---
 
-## Step 3 — Repo + local tests
+## Step 6 — Share Workspace resources with the runtime SA
 
-```bash
-git clone git@github.com:mishleyotis/grace.git
-cd grace
-git checkout claude/implement-stress-test-deploy-2m2XU   # or main
-
-make sync          # uv sync --all-packages
-make lint          # ruff
-make test          # pytest -q  →  118 passed
-make skill         # builds grace-pmo-director.skill at repo root
-```
-
-If any step fails, **stop and fix locally before deploying.** This entire
-guide assumes the local suite is green.
-
----
-
-## Step 4 — Terraform apply
-
-```bash
-cd infra/terraform
-
-cat > terraform.tfvars <<EOF
-gcp_project    = "$GCP_PROJECT"
-gcp_region     = "$GCP_REGION"
-github_repo    = "mishleyotis/grace"
-alert_email    = "pmo-grace-alerts@zennify.com"  # optional; leave "" to skip
-min_instances  = 0                                # set to 1 for no cold starts
-EOF
-
-terraform init
-terraform plan -out plan.tfplan
-terraform apply plan.tfplan
-
-terraform output -json > ../../outputs.json
-```
-
-Capture the outputs you will need shortly:
-
-```bash
-SITE_MIRROR_URL=$(terraform output -raw site_mirror_url)
-SHEETS_URL=$(terraform output -raw sheets_url)
-SLACK_URL=$(terraform output -raw slack_url)
-ORCHESTRATOR_URL=$(terraform output -raw orchestrator_url)
-RUNTIME_SA=$(terraform output -raw runtime_sa_email)
-DEPLOYER_SA=$(terraform output -raw deployer_sa_email)
-WIF_PROVIDER=$(terraform output -raw wif_provider)
-ARTIFACT_REGISTRY=$(terraform output -raw artifact_registry_repo)
-```
-
-> **Note:** The Cloud Run services exist now but each one points at an image
-> tag that doesn't yet exist (`:latest`). Health checks will fail until the
-> CI/CD pipeline runs in step 8.
-
----
-
-## Step 5 — Share Workspace resources with the runtime SA
-
-The runtime SA is **not a Terraform resource** for Drive / Sheets ACLs —
-those are Workspace-managed. Grant the following access manually via the
-Google Workspace UI:
+Drive / Sheets ACLs are **Workspace-managed**, not GCP-managed. Do this in
+the Google Workspace UI as a Workspace admin:
 
 | Resource | Access | Email |
 |----------|--------|-------|
 | Drive Map sheet (`19VQxsUb7pnnxTWP0vQzLLjIZWKU3k382lOEVYSnyiKE`) | **Viewer** | `$RUNTIME_SA` |
 | Onboarding Tracker (`197CSSit_xi872N8oF3_uhV-LYxvRQwA42rfkknLCgEc`) | **Editor** | `$RUNTIME_SA` |
-| ZennSource shared Drive (`0AGq-3ZBpQU5MUk9PVA`) | **Viewer** (drive member) | `$RUNTIME_SA` |
+| ZennSource shared Drive (`0AGq-3ZBpQU5MUk9PVA`) | **Viewer** (drive-level member) | `$RUNTIME_SA` |
 
-Verify by hitting Drive's `files.get` with the runtime SA:
+Verify after sharing (using your own `gcloud auth application-default`
+credentials is fine for the check):
 
 ```bash
-gcloud auth print-access-token --impersonate-service-account="$RUNTIME_SA" \
+gcloud auth application-default print-access-token \
   | xargs -I {} curl -sS -H "Authorization: Bearer {}" \
-    "https://www.googleapis.com/drive/v3/files/19VQxsUb7pnnxTWP0vQzLLjIZWKU3k382lOEVYSnyiKE?fields=id,name"
+    "https://www.googleapis.com/drive/v3/files/19VQxsUb7pnnxTWP0vQzLLjIZWKU3k382lOEVYSnyiKE?fields=id,name&supportsAllDrives=true"
 ```
 
-Expected: a JSON body with the file's id and name. A 404/403 means the
-share isn't propagated yet — wait 60 seconds and retry.
+Expect a JSON body with the file's `id` and `name`. A 403/404 means the
+share isn't propagated yet — wait ~60 seconds and retry.
 
 ---
 
-## Step 6 — Slack bot + authoritative-sender lookup
+## Step 7 — Slack bot + authoritative-sender IDs
 
-1. **Create a Slack app** at https://api.slack.com/apps?new_app=1.
-   - App name: `Grace PMO Bot`
+1. Create a Slack app at https://api.slack.com/apps?new_app=1 ("From scratch").
+   - Name: `Grace PMO Bot`
    - Workspace: Zennify
-2. **OAuth & Permissions → Scopes (Bot Token Scopes)**: add
-   `channels:history`, `channels:read`, `users:read`.
-3. **Install to workspace** and capture the `xoxb-…` bot token.
+2. **OAuth & Permissions → Bot Token Scopes**: add `channels:history`,
+   `channels:read`, `users:read`.
+3. **Install to workspace** and copy the `xoxb-…` Bot User OAuth Token.
 4. Invite the bot to `#zennify_pmo`:
    ```
    /invite @grace-pmo-bot
    ```
 5. Look up the **6 authoritative senders' Slack user IDs**. In the Slack
-   client: profile → ••• menu → "Copy member ID". Names → IDs:
+   client: profile → ••• → "Copy member ID":
 
    | Name | User ID |
    |------|---------|
@@ -194,96 +213,202 @@ share isn't propagated yet — wait 60 seconds and retry.
    | Michael Rouleau | U… |
    | Tom Hedgecoth | U… |
 
-6. **Compose** the comma-separated list, e.g.:
-   ```
-   U03ABC,U04DEF,U05GHI,U06JKL,U07MNO,U08PQR
+6. Stash the values for the next step:
+
+   ```bash
+   export SLACK_BOT_TOKEN="xoxb-XXXXXXXXXXXXX-XXXXXXXXXXXXX-XXXXXXXXXXXXXXXX"
+   export AUTH_SLACK_IDS="U03ABC,U04DEF,U05GHI,U06JKL,U07MNO,U08PQR"
    ```
 
 ---
 
-## Step 7 — Populate Secret Manager
-
-Bearer token (one shared across all 4 services):
+## Step 8 — Create + populate the 4 secrets
 
 ```bash
-BEARER_TOKEN=$(openssl rand -hex 32)
-echo -n "$BEARER_TOKEN" | gcloud secrets versions add \
-  grace-mcp-bearer-token --data-file=- --project="$GCP_PROJECT"
-```
+# Generate a strong bearer token (one shared across all 4 services + Skill).
+export BEARER_TOKEN="$(openssl rand -hex 32)"
 
-Slack bot token:
-
-```bash
-echo -n "xoxb-XXXXXXXXXXXXX-XXXXXXXXXXXXX-XXXXXXXXXXXXXXXX" | \
-  gcloud secrets versions add grace-slack-bot-token \
-    --data-file=- --project="$GCP_PROJECT"
-```
-
-Apps Script URL:
-
-```bash
-echo -n "https://script.google.com/macros/s/AKfycbyCJ5Fkyw8JySwT5G-aqWTDAtR6nN8n-Nv-PifbnOHJ4_gxkXwjWXl162Pl-Tjf3fE0/exec" | \
-  gcloud secrets versions add grace-apps-script-url \
-    --data-file=- --project="$GCP_PROJECT"
-```
-
-Authoritative Slack user IDs (comma-separated, no spaces):
-
-```bash
-echo -n "U03ABC,U04DEF,U05GHI,U06JKL,U07MNO,U08PQR" | \
-  gcloud secrets versions add grace-authoritative-slack-user-ids \
-    --data-file=- --project="$GCP_PROJECT"
-```
-
-**Confirm** each secret has exactly one enabled version:
-
-```bash
+# Create the secret resources (idempotent — `|| true` so re-runs are safe).
 for s in grace-mcp-bearer-token grace-slack-bot-token \
          grace-apps-script-url grace-authoritative-slack-user-ids; do
+  gcloud secrets create "$s" --replication-policy=automatic \
+    --project="$GCP_PROJECT" 2>/dev/null || true
+done
+
+# Add a version (the actual value) for each.
+printf '%s' "$BEARER_TOKEN" | gcloud secrets versions add \
+  grace-mcp-bearer-token --data-file=- --project="$GCP_PROJECT"
+
+printf '%s' "$SLACK_BOT_TOKEN" | gcloud secrets versions add \
+  grace-slack-bot-token --data-file=- --project="$GCP_PROJECT"
+
+printf '%s' "$APPS_SCRIPT_URL" | gcloud secrets versions add \
+  grace-apps-script-url --data-file=- --project="$GCP_PROJECT"
+
+printf '%s' "$AUTH_SLACK_IDS" | gcloud secrets versions add \
+  grace-authoritative-slack-user-ids --data-file=- --project="$GCP_PROJECT"
+
+# Grant the runtime SA accessor on each (project-level binding from step 4
+# already covers this, but explicit per-secret bindings are good hygiene).
+for s in grace-mcp-bearer-token grace-slack-bot-token \
+         grace-apps-script-url grace-authoritative-slack-user-ids; do
+  gcloud secrets add-iam-policy-binding "$s" \
+    --member="serviceAccount:${RUNTIME_SA}" \
+    --role="roles/secretmanager.secretAccessor" \
+    --project="$GCP_PROJECT" >/dev/null
+done
+
+# Confirm.
+for s in grace-mcp-bearer-token grace-slack-bot-token \
+         grace-apps-script-url grace-authoritative-slack-user-ids; do
+  echo "=== $s ==="
   gcloud secrets versions list "$s" --project="$GCP_PROJECT" --limit=1
 done
 ```
 
+> **Important:** `printf '%s'` avoids the trailing newline `echo -n` may
+> emit on some shells; the bearer-token check rejects mismatches strictly.
+
 ---
 
-## Step 8 — Configure GitHub Actions + push
+## Step 9 — Build + push the 4 Docker images
 
-In the GitHub repo, **Settings → Secrets and variables → Actions →
-Variables** (not Secrets — these are non-sensitive):
-
-| Variable | Value |
-|----------|-------|
-| `GCP_PROJECT` | `$GCP_PROJECT` |
-| `GCP_REGION` | `$GCP_REGION` |
-| `WIF_PROVIDER` | `$WIF_PROVIDER` |
-| `DEPLOYER_SA` | `$DEPLOYER_SA` |
-| `ARTIFACT_REGISTRY` | `$ARTIFACT_REGISTRY` |
-
-Then push to `main`:
+Run from the **repo root** (`grace-pmo-mcp/`):
 
 ```bash
-git push origin claude/implement-stress-test-deploy-2m2XU
-# Merge via PR, OR fast-forward main and push.
+cd /path/to/grace-pmo-mcp
+
+for svc in site-mirror sheets slack orchestrator; do
+  echo "==== Building grace-${svc}:${IMAGE_TAG} ===="
+  docker build \
+    -f "services/${svc}/Dockerfile" \
+    -t "${REGISTRY}/grace-${svc}:${IMAGE_TAG}" \
+    -t "${REGISTRY}/grace-${svc}:latest" \
+    .
+  docker push "${REGISTRY}/grace-${svc}:${IMAGE_TAG}"
+  docker push "${REGISTRY}/grace-${svc}:latest"
+done
 ```
 
-The `test-build-deploy` workflow will:
+> Each Dockerfile reads `pyproject.toml`, `libs/shared/`, and its own
+> `services/<svc>/` — the build context is the repo root.
 
-1. Run `uv sync --all-packages`, `ruff`, `pytest -q`.
-2. For each of the 4 services in parallel:
-   - Authenticate via Workload Identity Federation.
-   - Build the Docker image.
-   - Push to Artifact Registry.
-   - `gcloud run deploy` the new image.
-   - Smoke-test `$URL/healthz` (5 retries × 5 s).
-
-Watch the run at `https://github.com/mishleyotis/grace/actions`.
+> On Apple Silicon, prepend `DOCKER_DEFAULT_PLATFORM=linux/amd64` so the
+> images run on Cloud Run.
 
 ---
 
-## Step 9 — Post-deployment smoke tests
+## Step 10 — Deploy the 3 leaf services
 
-These match the E2E suite from the solution design (section 11.1). Run
-locally with `curl` after deploy completes.
+Cloud Run will fail to start the orchestrator if its 3 downstream URLs
+aren't known yet, so deploy in two waves. Each service is public-ingress
+(auth is enforced at the app layer via the shared bearer token).
+
+```bash
+# ---------- grace-site-mirror ----------
+gcloud run deploy grace-site-mirror \
+  --image "${REGISTRY}/grace-site-mirror:${IMAGE_TAG}" \
+  --region "$GCP_REGION" \
+  --project "$GCP_PROJECT" \
+  --service-account "$RUNTIME_SA" \
+  --allow-unauthenticated \
+  --ingress all \
+  --cpu 1 \
+  --memory 512Mi \
+  --min-instances 0 \
+  --max-instances 10 \
+  --port 8080 \
+  --set-env-vars "GCP_PROJECT=${GCP_PROJECT},LOG_LEVEL=INFO" \
+  --set-secrets "MCP_BEARER_TOKEN=grace-mcp-bearer-token:latest,APPS_SCRIPT_URL=grace-apps-script-url:latest"
+
+# ---------- grace-sheets ----------
+gcloud run deploy grace-sheets \
+  --image "${REGISTRY}/grace-sheets:${IMAGE_TAG}" \
+  --region "$GCP_REGION" \
+  --project "$GCP_PROJECT" \
+  --service-account "$RUNTIME_SA" \
+  --allow-unauthenticated \
+  --ingress all \
+  --cpu 1 \
+  --memory 512Mi \
+  --min-instances 0 \
+  --max-instances 10 \
+  --port 8080 \
+  --set-env-vars "GCP_PROJECT=${GCP_PROJECT},LOG_LEVEL=INFO" \
+  --set-secrets "MCP_BEARER_TOKEN=grace-mcp-bearer-token:latest"
+
+# ---------- grace-slack ----------
+gcloud run deploy grace-slack \
+  --image "${REGISTRY}/grace-slack:${IMAGE_TAG}" \
+  --region "$GCP_REGION" \
+  --project "$GCP_PROJECT" \
+  --service-account "$RUNTIME_SA" \
+  --allow-unauthenticated \
+  --ingress all \
+  --cpu 1 \
+  --memory 512Mi \
+  --min-instances 0 \
+  --max-instances 10 \
+  --port 8080 \
+  --set-env-vars "GCP_PROJECT=${GCP_PROJECT},LOG_LEVEL=INFO" \
+  --set-secrets "MCP_BEARER_TOKEN=grace-mcp-bearer-token:latest,SLACK_BOT_TOKEN=grace-slack-bot-token:latest,AUTHORITATIVE_SLACK_USER_IDS=grace-authoritative-slack-user-ids:latest"
+```
+
+Capture the three URLs:
+
+```bash
+export SITE_MIRROR_URL=$(gcloud run services describe grace-site-mirror \
+  --region "$GCP_REGION" --project "$GCP_PROJECT" --format='value(status.url)')
+export SHEETS_URL=$(gcloud run services describe grace-sheets \
+  --region "$GCP_REGION" --project "$GCP_PROJECT" --format='value(status.url)')
+export SLACK_URL=$(gcloud run services describe grace-slack \
+  --region "$GCP_REGION" --project "$GCP_PROJECT" --format='value(status.url)')
+
+echo "site-mirror: $SITE_MIRROR_URL"
+echo "sheets:      $SHEETS_URL"
+echo "slack:       $SLACK_URL"
+```
+
+---
+
+## Step 11 — Deploy `grace-orchestrator`
+
+The orchestrator needs the previous 3 URLs as env vars:
+
+```bash
+gcloud run deploy grace-orchestrator \
+  --image "${REGISTRY}/grace-orchestrator:${IMAGE_TAG}" \
+  --region "$GCP_REGION" \
+  --project "$GCP_PROJECT" \
+  --service-account "$RUNTIME_SA" \
+  --allow-unauthenticated \
+  --ingress all \
+  --cpu 1 \
+  --memory 512Mi \
+  --min-instances 0 \
+  --max-instances 10 \
+  --port 8080 \
+  --set-env-vars "GCP_PROJECT=${GCP_PROJECT},LOG_LEVEL=INFO,SITE_MIRROR_URL=${SITE_MIRROR_URL},SHEETS_URL=${SHEETS_URL},SLACK_URL=${SLACK_URL}" \
+  --set-secrets "MCP_BEARER_TOKEN=grace-mcp-bearer-token:latest"
+
+export ORCHESTRATOR_URL=$(gcloud run services describe grace-orchestrator \
+  --region "$GCP_REGION" --project "$GCP_PROJECT" --format='value(status.url)')
+
+echo "orchestrator: $ORCHESTRATOR_URL"
+```
+
+> **Tip:** If you later change one of the leaf URLs (e.g. you redeploy
+> into a different region), update the orchestrator with
+> `gcloud run services update grace-orchestrator --update-env-vars ...`
+> and bump a `ROTATION_NONCE` to force a new revision.
+
+---
+
+## Step 12 — Smoke tests (7 checks)
+
+These mirror the E2E suite from the solution design (section 11.1).
+
+**E2E-1 — All 4 services healthy:**
 
 ```bash
 for URL in "$SITE_MIRROR_URL" "$SHEETS_URL" "$SLACK_URL" "$ORCHESTRATOR_URL"; do
@@ -294,140 +419,178 @@ done
 
 Each must return `{"status":"ok","service":"<name>"}` with HTTP 200.
 
-**E2E-2 — Bearer auth gate** (must 401 without a token):
+**E2E-2 — Bearer auth gate:**
 
 ```bash
-curl -sS -o /dev/null -w "%{http_code}\n" "$ORCHESTRATOR_URL/mcp/"
-# Expected: 401
-curl -sS -o /dev/null -w "%{http_code}\n" \
-  -H "Authorization: Bearer $BEARER_TOKEN" "$ORCHESTRATOR_URL/mcp/"
-# Expected: 200 (or 405, depending on MCP transport — but NOT 401)
+# Without bearer -> 401
+curl -sS -o /dev/null -w "without bearer: %{http_code}\n" "$ORCHESTRATOR_URL/mcp/"
+
+# With the right bearer -> 200 (or 405/406 from MCP discovery, NOT 401)
+curl -sS -o /dev/null -w "with bearer:    %{http_code}\n" \
+  -H "Authorization: Bearer $BEARER_TOKEN" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":"x","method":"tools/list"}' \
+  "$ORCHESTRATOR_URL/mcp/"
 ```
+
+The remaining checks call the services via JSON-RPC. Define a small helper:
+
+```bash
+mcp_call () {
+  local url=$1 tool=$2 args=$3
+  curl -sS -H "Authorization: Bearer $BEARER_TOKEN" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "Content-Type: application/json" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":\"smoke\",\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}" \
+    "$url/mcp/"
+}
+```
+
+(The MCP server may respond with `text/event-stream`. Pipe through
+`tr -d '\r' | grep '^data:' | sed 's/^data: //' | jq .` to parse SSE bodies
+if jq complains.)
 
 **E2E-3 — Tier 1 canonical URLs:**
 
 ```bash
-curl -sS -H "Authorization: Bearer $BEARER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"kickoff","limit":3}' \
-  "$SITE_MIRROR_URL/mcp/tools/site_mirror_search/invoke" | \
-  jq '.results[].siteUrl' | grep -qE '^"https://sites\.google\.com/zennify\.com/delivery/' && \
-  echo "PASS" || echo "FAIL"
+mcp_call "$SITE_MIRROR_URL" site_mirror_search '{"query":"kickoff","limit":3}' \
+  | jq -r '.result.structuredContent.results[].siteUrl' \
+  | grep -qE '^https://sites\.google\.com/zennify\.com/delivery/' \
+  && echo PASS || echo FAIL
 ```
 
-**E2E-4 — Drive Map ZS_ priority:**
+**E2E-4 — Tier 2 ZS_ priority:**
 
 ```bash
-curl -sS -H "Authorization: Bearer $BEARER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"delivery checklist","limit":5}' \
-  "$SHEETS_URL/mcp/tools/drive_map_search/invoke" | \
-  jq '.results[0] | {name, score}'
-# Expect: name starting with "ZS_", score > 100
+mcp_call "$SHEETS_URL" drive_map_search '{"query":"delivery checklist","limit":5}' \
+  | jq '.result.structuredContent.results[0] | {name, score}'
+# Expect: name starting with "ZS_", score > 100.
 ```
 
-**E2E-5 — `drive_doc_read`:**
+**E2E-5 — `drive_doc_read` returns content:**
 
 ```bash
-curl -sS -H "Authorization: Bearer $BEARER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"file_id":"1AsE2UFl0HGouxxAwRIEsPuc2KxLY7Xw4EtKOeUPVLDQ","max_chars":2000}' \
-  "$SHEETS_URL/mcp/tools/drive_doc_read/invoke" | \
-  jq '{status, char_count, mime_type}'
-# Expect: status=ok, char_count>0
+mcp_call "$SHEETS_URL" drive_doc_read \
+  '{"file_id":"1AsE2UFl0HGouxxAwRIEsPuc2KxLY7Xw4EtKOeUPVLDQ","max_chars":2000}' \
+  | jq '.result.structuredContent | {status, char_count, mime_type}'
+# Expect: status=ok, char_count>0.
 ```
 
 **E2E-6 — Slack authoritative-only default:**
 
 ```bash
-curl -sS -H "Authorization: Bearer $BEARER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"kickoff","limit":3}' \
-  "$SLACK_URL/mcp/tools/slack_search_pmo/invoke" | \
-  jq '{authoritative_only, authoritative_senders_configured, all_auth: ([.results[].is_authoritative] | all)}'
-# Expect: authoritative_only=true, configured=6, all_auth=true
+mcp_call "$SLACK_URL" slack_search_pmo '{"query":"kickoff","limit":3}' \
+  | jq '.result.structuredContent | {authoritative_only, authoritative_senders_configured, n: (.results|length)}'
+# Expect: authoritative_only=true, authoritative_senders_configured=6.
 ```
 
-**E2E-7 — Orchestrator fan-out:**
+**E2E-7 — Orchestrator parallel fan-out:**
 
 ```bash
-curl -sS -H "Authorization: Bearer $BEARER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"change requests","per_tier_limit":5}' \
-  "$ORCHESTRATOR_URL/mcp/tools/pmo_retrieve_grounding_bundle/invoke" | \
-  jq '{tiers: (.tiers | to_entries | map({(.key): .value.status}) | add), n: .evidence_count}'
-# Expect: each tier shows ok/no_results/error: …, n >= 1
+mcp_call "$ORCHESTRATOR_URL" pmo_retrieve_grounding_bundle \
+  '{"query":"change requests","per_tier_limit":5}' \
+  | jq '.result.structuredContent | {tiers: (.tiers | to_entries | map({(.key): .value.status}) | add), n: .evidence_count}'
+# Expect: each tier shows ok/no_results/error: ..., n >= 1.
 ```
 
-If any check fails, see "Troubleshooting" below.
+If any check fails, see **Troubleshooting** below.
 
 ---
 
-## Step 10 — Wire the Skill into a Claude project
+## Step 13 — Wire MCPs + upload the Skill into a Claude project
 
-1. In the Anthropic console, create (or open) a Claude project named
+1. Build the Skill bundle locally (only needs `zip`):
+
+   ```bash
+   cd /path/to/grace-pmo-mcp
+   make skill          # writes grace-pmo-director.skill at repo root
+   # or, equivalently:
+   cd skills && zip -r ../grace-pmo-director.skill grace-pmo-director/ -x '**/.DS_Store'
+   ```
+
+2. In the Anthropic console, open (or create) a Claude project named
    "Grace — PMO Assistant".
-2. **Settings → MCP servers → Add server.** Add four entries, each with
-   the corresponding Cloud Run URL and the bearer token (`$BEARER_TOKEN`):
+
+3. **Settings → MCP servers → Add server.** Add four entries; each one uses
+   the corresponding Cloud Run URL with `/mcp` appended and the bearer
+   token `$BEARER_TOKEN`:
 
    | Name | URL |
    |------|-----|
-   | grace-site-mirror | `$SITE_MIRROR_URL/mcp` |
-   | grace-sheets | `$SHEETS_URL/mcp` |
-   | grace-slack | `$SLACK_URL/mcp` |
-   | grace-orchestrator | `$ORCHESTRATOR_URL/mcp` |
+   | grace-site-mirror | `${SITE_MIRROR_URL}/mcp` |
+   | grace-sheets | `${SHEETS_URL}/mcp` |
+   | grace-slack | `${SLACK_URL}/mcp` |
+   | grace-orchestrator | `${ORCHESTRATOR_URL}/mcp` |
 
-3. **Skills → Upload** the `grace-pmo-director.skill` artifact built in
-   step 3.
-4. Smoke-test in the project chat:
-   - "How do we handle change requests?" → should return a grounded
-     answer with a 3-tier grounding block.
-   - "What's a good lunch spot?" → should return the canned refusal.
-   - "What's the URL of the underlying mirror document?" → canned refusal.
+4. **Skills → Upload** the `grace-pmo-director.skill` artifact.
 
-You are live. Send the project link to the PMO team.
+5. Smoke-test in the project chat:
+   - *"How do we handle change requests?"* → grounded answer with the
+     3-tier grounding block.
+   - *"What's a good lunch spot?"* → canned refusal verbatim.
+   - *"What's the URL of the underlying mirror document?"* → canned refusal.
+
+You're live.
 
 ---
 
 ## Operations runbook
 
-### View logs
+### View live logs
 
 ```bash
-gcloud logging tail "resource.type=cloud_run_revision AND \
-  resource.labels.service_name=grace-orchestrator" \
+gcloud logging tail \
+  "resource.type=cloud_run_revision AND resource.labels.service_name=grace-orchestrator" \
   --project="$GCP_PROJECT"
 ```
 
-### Read recent errors
+### Recent errors across all services
 
 ```bash
-gcloud logging read 'severity>=ERROR resource.type="cloud_run_revision"' \
-  --limit=50 --format='value(jsonPayload.message)' --project="$GCP_PROJECT"
+gcloud logging read \
+  'severity>=ERROR AND resource.type="cloud_run_revision" AND
+   resource.labels.service_name=~"^grace-"' \
+  --limit=50 --format='value(timestamp, resource.labels.service_name, jsonPayload.message)' \
+  --project="$GCP_PROJECT"
 ```
 
 ### Rotate the bearer token
 
-> Plan a short outage window — the Skill will 401 between step 2 and step 3.
-
 ```bash
 NEW=$(openssl rand -hex 32)
-echo -n "$NEW" | gcloud secrets versions add grace-mcp-bearer-token \
+printf '%s' "$NEW" | gcloud secrets versions add grace-mcp-bearer-token \
   --data-file=- --project="$GCP_PROJECT"
-# Force a Cloud Run revision so the new secret value is picked up:
+
+# Force every service to pick up the new secret version.
 NONCE=$(date +%s)
 for svc in grace-site-mirror grace-sheets grace-slack grace-orchestrator; do
   gcloud run services update "$svc" \
     --region="$GCP_REGION" --project="$GCP_PROJECT" \
-    --update-env-vars="ROTATION_NONCE=$NONCE"
+    --update-env-vars="ROTATION_NONCE=${NONCE}"
 done
-# Then update the Anthropic project's MCP server configs with $NEW.
+
+# Update the Skill connector configs in the Anthropic console with $NEW.
 ```
 
-### Rotate the Slack bot token
+> Plan ~5 minutes of downtime — the Skill will 401 between
+> "secret added" and "Anthropic connector updated".
+
+### Rotate the Slack token
 
 ```bash
-echo -n "xoxb-NEW…" | gcloud secrets versions add grace-slack-bot-token \
+printf '%s' "xoxb-NEW..." | gcloud secrets versions add grace-slack-bot-token \
+  --data-file=- --project="$GCP_PROJECT"
+gcloud run services update grace-slack \
+  --region="$GCP_REGION" --project="$GCP_PROJECT" \
+  --update-env-vars="ROTATION_NONCE=$(date +%s)"
+```
+
+### Update the authoritative-sender list
+
+```bash
+printf '%s' "U...,U...,U...,U...,U...,U..." | \
+  gcloud secrets versions add grace-authoritative-slack-user-ids \
   --data-file=- --project="$GCP_PROJECT"
 gcloud run services update grace-slack \
   --region="$GCP_REGION" --project="$GCP_PROJECT" \
@@ -437,7 +600,7 @@ gcloud run services update grace-slack \
 ### Update the Apps Script URL
 
 ```bash
-echo -n "https://script.google.com/macros/s/NEW…/exec" | \
+printf '%s' "https://script.google.com/macros/s/NEW.../exec" | \
   gcloud secrets versions add grace-apps-script-url \
   --data-file=- --project="$GCP_PROJECT"
 gcloud run services update grace-site-mirror \
@@ -445,34 +608,48 @@ gcloud run services update grace-site-mirror \
   --update-env-vars="ROTATION_NONCE=$(date +%s)"
 ```
 
-### Update the authoritative-sender list
+### Redeploy a single service (new code)
 
 ```bash
-echo -n "U…,U…,U…,U…,U…,U…" | \
-  gcloud secrets versions add grace-authoritative-slack-user-ids \
-  --data-file=- --project="$GCP_PROJECT"
-gcloud run services update grace-slack \
-  --region="$GCP_REGION" --project="$GCP_PROJECT" \
-  --update-env-vars="ROTATION_NONCE=$(date +%s)"
+svc=sheets   # site-mirror | sheets | slack | orchestrator
+TAG=$(date +%Y%m%d-%H%M%S)
+docker build -f "services/${svc}/Dockerfile" \
+  -t "${REGISTRY}/grace-${svc}:${TAG}" .
+docker push "${REGISTRY}/grace-${svc}:${TAG}"
+gcloud run deploy "grace-${svc}" \
+  --image "${REGISTRY}/grace-${svc}:${TAG}" \
+  --region "$GCP_REGION" --project "$GCP_PROJECT"
 ```
 
-### Rollback a service
+### Roll back to a previous revision
 
 ```bash
+gcloud run revisions list --service grace-orchestrator \
+  --region "$GCP_REGION" --project "$GCP_PROJECT"
+
 gcloud run services update-traffic grace-orchestrator \
   --to-revisions=grace-orchestrator-00012-abc=100 \
-  --region="$GCP_REGION" --project="$GCP_PROJECT"
+  --region "$GCP_REGION" --project "$GCP_PROJECT"
 ```
 
 ### Teardown
 
 ```bash
-# Delete the secret values first (Terraform won't manage secret versions).
+for svc in grace-site-mirror grace-sheets grace-slack grace-orchestrator; do
+  gcloud run services delete "$svc" \
+    --region "$GCP_REGION" --project "$GCP_PROJECT" --quiet
+done
+
 for s in grace-mcp-bearer-token grace-slack-bot-token \
          grace-apps-script-url grace-authoritative-slack-user-ids; do
   gcloud secrets delete "$s" --project="$GCP_PROJECT" --quiet
 done
-cd infra/terraform && terraform destroy
+
+gcloud artifacts repositories delete "$AR_REPO" \
+  --location "$GCP_REGION" --project "$GCP_PROJECT" --quiet
+
+gcloud iam service-accounts delete "$RUNTIME_SA" \
+  --project "$GCP_PROJECT" --quiet
 ```
 
 ---
@@ -481,15 +658,17 @@ cd infra/terraform && terraform destroy
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| `/healthz` 200 but `/mcp/...` 401 with correct token | Skill MCP server config has stale bearer | Update Anthropic console |
-| `grace-sheets` returns `upstream_error: permission denied` | Runtime SA missing Editor on Tracker / Viewer on Drive Map | Re-do step 5 |
-| `grace-slack` returns `no_results` + `warning: AUTHORITATIVE_SLACK_USER_IDS env var not set` | Secret value empty or not redeployed | Re-add secret + nonce env update |
-| `grace-site-mirror` returns `upstream_error: request failed` | Apps Script down or wrong URL | curl the URL directly (step 2) |
-| Cloud Run service stuck at "Provisioning" | Image tag doesn't exist | Run GHA deploy on `main` |
-| `gcloud run deploy` fails with permission denied | Deployer SA missing `roles/run.admin` | `terraform apply` (re-creates IAM) |
-| WIF authentication fails in GHA | Wrong `github_repo` in tfvars | Update tfvars, `terraform apply` |
-| Tests pass locally, fail in CI | Different Python version | `.python-version` pins 3.12; check GHA logs |
-| Internal URL appears in a response | Bug — file a P0 | `url_canon.py` must scrub everything |
+| `/healthz` 200 but `/mcp/` 401 with correct token | Skill connector has stale bearer | Update the bearer in the Anthropic console |
+| `grace-sheets` returns `upstream_error: permission denied` | Runtime SA missing Editor on Tracker / Viewer on Drive Map | Re-do step 6 |
+| `grace-slack` returns `no_results` + `warning: AUTHORITATIVE_SLACK_USER_IDS env var not set` | Secret value empty or service not redeployed with the new version | Re-add the secret + `ROTATION_NONCE` update |
+| `grace-site-mirror` returns `upstream_error: request failed` | Apps Script URL wrong or rate-limited | Re-check step 5 |
+| Cloud Run service stuck "Provisioning" | Image tag not in Artifact Registry | Re-run `docker push` from step 9 |
+| `gcloud run deploy` fails with `PERMISSION_DENIED` on secret | Runtime SA missing `secretmanager.secretAccessor` | Re-do step 4 |
+| `gcloud run deploy` fails with `iam.serviceAccountUser` denied | Your gcloud principal lacks `roles/iam.serviceAccountUser` on the runtime SA | Add: `gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" --member="user:you@org" --role=roles/iam.serviceAccountUser` |
+| Orchestrator returns `error: UpstreamError` for one tier | Tier service's URL env var missing | `gcloud run services describe grace-orchestrator` and inspect `SITE_MIRROR_URL` / `SHEETS_URL` / `SLACK_URL`; redeploy with `--update-env-vars` if needed |
+| Image runs on M1/M2 Mac but crashes on Cloud Run | ARM image pushed | Re-build with `DOCKER_DEFAULT_PLATFORM=linux/amd64` |
+| MCP smoke calls return `text/event-stream` and `jq` fails | SSE response | Use the SSE-aware parse: `tr -d '\r' \| grep '^data:' \| sed 's/^data: //' \| jq .` |
+| Internal URL leaks into any response | Bug — file a P0 | `url_canon.py` is supposed to scrub; check `grace_shared.url_canon` and the Site Mirror tools |
 
 ---
 
@@ -503,8 +682,8 @@ cd infra/terraform && terraform destroy
 | Artifact Registry (4 images) | < $1 |
 | **Total** | **~$5 – $15 / month** |
 
-Set `min_instances = 1` to eliminate cold starts at ~$30/mo per service
-(~$120/mo total).
+To eliminate cold starts (~5–8 s on a cold service), bump `--min-instances`
+to `1` on each `gcloud run deploy` — adds ~$30/mo per service (~$120/mo).
 
 ---
 
@@ -512,16 +691,90 @@ Set `min_instances = 1` to eliminate cold starts at ~$30/mo per service
 
 A deployment is **acceptable** when all of these hold:
 
-- [ ] `terraform apply` succeeded, all 4 Cloud Run services healthy.
 - [ ] All 4 services return 200 on `/healthz`.
-- [ ] All 4 services return 401 on `/mcp/*` without a bearer; 200 with correct bearer.
-- [ ] `site_mirror_search` returns `sites.google.com/zennify.com/...` URLs only; never the mirror doc ID or Apps Script URL.
+- [ ] All 4 services return 401 on `/mcp/` without a bearer; 2xx with the correct bearer.
+- [ ] `site_mirror_search("kickoff")` returns only `sites.google.com/zennify.com/...` URLs; never the mirror doc ID or the Apps Script URL.
 - [ ] `drive_map_search("delivery checklist")` top result starts with `ZS_` and has score > 100.
-- [ ] `drive_doc_read` on a known ZS_ doc returns non-empty `text`.
-- [ ] `slack_search_pmo` defaults to `authoritative_only=true`, reports `authoritative_senders_configured: 6`, and only auth senders appear.
-- [ ] `pmo_retrieve_grounding_bundle` returns all 3 tiers' statuses; failing tiers don't kill the others.
+- [ ] `drive_doc_read(<ZS_doc_id>)` returns non-empty `text`.
+- [ ] `slack_search_pmo("kickoff")` defaults to `authoritative_only=true`, reports `authoritative_senders_configured: 6`, and every result has `is_authoritative: true`.
+- [ ] `pmo_retrieve_grounding_bundle("...")` returns all 3 tiers' statuses; a single tier failing returns the other two's results.
 - [ ] Skill in Claude project: off-topic question → canned refusal verbatim.
-- [ ] Skill: in-scope question → grounded answer with grounding block.
-- [ ] Skill: "make it specific to Zennify" → fresh MCP calls (verifiable in Cloud Logging).
+- [ ] Skill: in-scope question → grounded answer with the 3-tier grounding block.
+- [ ] Skill: "Make it specific to Zennify" → fresh MCP calls (verifiable in Cloud Logging).
 - [ ] Skill: no response contains the mirror doc ID or Apps Script URL.
-- [ ] Skill: no response contains "typically", "generally", "as I mentioned earlier", or other forbidden inference markers.
+- [ ] Skill: no response contains "typically", "generally", "as I mentioned earlier", or any other forbidden inference marker.
+
+---
+
+## Appendix A — One-shot redeploy script
+
+Once everything is wired, this snippet rebuilds + redeploys all 4 services
+on every change. Run it from the repo root.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+: "${GCP_PROJECT?}"; : "${GCP_REGION?}"; : "${REGISTRY?}"; : "${RUNTIME_SA?}"
+
+TAG=$(date +%Y%m%d-%H%M%S)
+
+for svc in site-mirror sheets slack orchestrator; do
+  echo "==== build+push grace-${svc}:${TAG} ===="
+  docker build -f "services/${svc}/Dockerfile" \
+    -t "${REGISTRY}/grace-${svc}:${TAG}" \
+    -t "${REGISTRY}/grace-${svc}:latest" .
+  docker push "${REGISTRY}/grace-${svc}:${TAG}"
+  docker push "${REGISTRY}/grace-${svc}:latest"
+done
+
+for svc in site-mirror sheets slack orchestrator; do
+  gcloud run services update "grace-${svc}" \
+    --image "${REGISTRY}/grace-${svc}:${TAG}" \
+    --region "$GCP_REGION" --project "$GCP_PROJECT"
+done
+
+# Smoke-test
+for svc in site-mirror sheets slack orchestrator; do
+  url=$(gcloud run services describe "grace-${svc}" \
+    --region "$GCP_REGION" --project "$GCP_PROJECT" \
+    --format='value(status.url)')
+  echo "$svc -> $(curl -sS -o /dev/null -w '%{http_code}' "$url/healthz")"
+done
+```
+
+---
+
+## Appendix B — MCP JSON-RPC quick reference
+
+Every tool can be invoked from the shell with one curl call:
+
+```bash
+curl -sS \
+  -H "Authorization: Bearer $BEARER_TOKEN" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "tools/call",
+        "params": {
+          "name": "<TOOL_NAME>",
+          "arguments": { <args> }
+        }
+      }' \
+  "$URL/mcp/"
+```
+
+Tool list across the 4 services (16 total) — see
+`skills/grace-pmo-director/references/mcp_tool_map.md`.
+
+Discover tools at runtime:
+
+```bash
+curl -sS \
+  -H "Authorization: Bearer $BEARER_TOKEN" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":"1","method":"tools/list"}' \
+  "$URL/mcp/" | jq '.result.tools[].name'
+```
