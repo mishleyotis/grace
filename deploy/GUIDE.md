@@ -117,11 +117,13 @@ This takes ~30 seconds to fully propagate.
 ## Step 2 — Create the Artifact Registry repo
 
 ```bash
+# Idempotent: if the repo already exists, that's fine — keep going.
 gcloud artifacts repositories create "$AR_REPO" \
   --repository-format=docker \
   --location="$GCP_REGION" \
   --description="Grace MCP service images" \
-  --project="$GCP_PROJECT"
+  --project="$GCP_PROJECT" 2>/dev/null || \
+  echo "Repo $AR_REPO already exists in $GCP_REGION — continuing."
 
 # Configure docker to authenticate against this registry.
 gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
@@ -134,10 +136,13 @@ gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
 All 4 Cloud Run services run as this single SA.
 
 ```bash
+# Idempotent: SA may already exist from a previous run.
 gcloud iam service-accounts create "$RUNTIME_SA_NAME" \
   --display-name="Grace MCP runtime" \
-  --project="$GCP_PROJECT"
+  --project="$GCP_PROJECT" 2>/dev/null || \
+  echo "SA $RUNTIME_SA already exists — continuing."
 
+# add-iam-policy-binding is naturally idempotent; safe to re-run.
 gcloud projects add-iam-policy-binding "$GCP_PROJECT" \
   --member="serviceAccount:${RUNTIME_SA}" \
   --role="roles/secretmanager.secretAccessor" \
@@ -162,16 +167,49 @@ gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
 ## Step 4 — Verify the SiteMirrorQuery Apps Script
 
 ```bash
-curl -sS \
-  'https://script.google.com/macros/s/AKfycbyCJ5Fkyw8JySwT5G-aqWTDAtR6nN8n-Nv-PifbnOHJ4_gxkXwjWXl162Pl-Tjf3fE0/exec?action=getURLIndex' \
-  | jq '.pages | length'
+export APPS_SCRIPT_URL="https://script.google.com/macros/s/AKfycbyCJ5Fkyw8JySwT5G-aqWTDAtR6nN8n-Nv-PifbnOHJ4_gxkXwjWXl162Pl-Tjf3fE0/exec"
+
+curl -sS "${APPS_SCRIPT_URL}?action=getURLIndex" | jq '.pages | length'
 ```
 
-A number around 60 confirms the mirror is up. Stash the URL — it goes into
-Secret Manager in step 7:
+A number around 60 confirms the mirror is up.
+
+### Troubleshooting: `jq: parse error: Invalid numeric literal`
+
+This means the Apps Script returned **non-JSON** (usually an HTML login
+redirect). Inspect what came back:
 
 ```bash
-export APPS_SCRIPT_URL="https://script.google.com/macros/s/AKfycbyCJ5Fkyw8JySwT5G-aqWTDAtR6nN8n-Nv-PifbnOHJ4_gxkXwjWXl162Pl-Tjf3fE0/exec"
+curl -sSL -i "${APPS_SCRIPT_URL}?action=getURLIndex" | head -c 1500; echo
+```
+
+| What you see in the response | Cause | Fix |
+|------------------------------|-------|-----|
+| `Location: https://accounts.google.com/...ServiceLogin` + HTML | Apps Script deployed as **Who has access: Only myself / org** | Script owner: Apps Script editor → **Deploy → Manage deployments → ✏️** → **Who has access: Anyone** |
+| `HTTP/2 200` with an HTML body containing "Apps Script" | **Execute as: User accessing the web app** but anonymous can't auth | Script owner: redeploy with **Execute as: Me** + **Who has access: Anyone** |
+| `HTTP/2 200` + "Authorization is required to perform that action" | Script's execution identity lost access to the mirror doc | Script owner opens the script editor and runs any function once to re-authorize |
+| `HTTP/2 404` or "Sorry, unable to open the file at this time." | Deployment was rotated → new `/exec` URL | Get the new `/exec` URL from the script owner; update `APPS_SCRIPT_URL` |
+
+If you can't fix the script immediately, you can still continue with the
+deploy by stashing a **placeholder** URL — `grace-site-mirror` will return
+`upstream_error` for every call, but the other 2 leaf services and the
+orchestrator will work, and the orchestrator's per-tier failure isolation
+will report Tier 1 as `error:` while still returning Tiers 2 and 3.
+
+```bash
+# ONLY if the real URL isn't ready yet:
+export APPS_SCRIPT_URL="https://script.google.com/macros/s/PLACEHOLDER/exec"
+```
+
+Later, swap in the real URL with no downtime:
+
+```bash
+printf '%s' "https://script.google.com/macros/s/REAL.../exec" | \
+  gcloud secrets versions add grace-apps-script-url \
+    --data-file=- --project="$GCP_PROJECT"
+gcloud run services update grace-site-mirror \
+  --region="$GCP_REGION" --project="$GCP_PROJECT" \
+  --update-env-vars="ROTATION_NONCE=$(date +%s)"
 ```
 
 ---
