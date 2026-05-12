@@ -120,7 +120,14 @@ def build_healthz(service_name: str) -> Callable[..., Awaitable[Any]]:
 
 
 def build_app(mcp: Any, *, name: str, config: ServiceConfig) -> Any:
-    """Wrap a FastMCP instance into a Starlette ASGI app with auth + healthz + logging."""
+    """Wrap a FastMCP instance into a Starlette ASGI app with auth + healthz + logging.
+
+    FastMCP's ``http_app()`` mounts its JSON-RPC handler at ``/mcp/`` inside
+    its own ASGI tree by default. We mount that app at the **root** of our
+    outer Starlette app so the external URL is also ``/mcp/`` — not
+    ``/mcp/mcp/``. ``/healthz`` is registered as a sibling route ahead of
+    the mount so it always wins for that exact path.
+    """
     from starlette.applications import Starlette  # type: ignore
     from starlette.routing import Mount, Route  # type: ignore
 
@@ -129,10 +136,14 @@ def build_app(mcp: Any, *, name: str, config: ServiceConfig) -> Any:
         format="%(message)s",
     )
 
-    mcp_app = mcp.http_app() if hasattr(mcp, "http_app") else mcp.streamable_http_app()
+    if hasattr(mcp, "http_app"):
+        mcp_app = mcp.http_app()
+    else:
+        mcp_app = mcp.streamable_http_app()
+
     routes = [
         Route("/healthz", build_healthz(name)),
-        Mount("/mcp", app=mcp_app),
+        Mount("/", app=mcp_app),
     ]
     app = Starlette(routes=routes, lifespan=getattr(mcp_app, "lifespan", None))
     app = BearerAuthMiddleware(app, expected_token=config.bearer_token, service=name)
