@@ -229,3 +229,83 @@ async def test_concurrent_mixed_tools_no_state_bleed():
         tasks.append(tools.site_mirror_get_url_index(c))
     out = await asyncio.gather(*tasks)
     assert all(r.get("status") == "ok" for r in out)
+
+
+# ---------------------------------------------------------------------------
+# Real SiteMirrorQuery response-shape compatibility (verified against the
+# live web app on 2026-05-12: getURLIndex returns `sections` with
+# `pageName`/`paraStart`/`paraEnd`; searchSections expects `q=`).
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_get_url_index_real_shape_with_sections_and_pageName():
+    body = {
+        "action": "getURLIndex",
+        "totalPages": 2,
+        "mirrorDocId": MIRROR_DOC_ID,  # MUST be scrubbed from output
+        "sections": [
+            {
+                "pageName": "Home",
+                "siteUrl": "https://sites.google.com/zennify.com/delivery/home",
+                "sitePath": "/home",
+                "paraStart": 5254,
+                "paraEnd": 5256,
+            },
+            {
+                "pageName": "1.0 Initiate",
+                "siteUrl": "https://sites.google.com/zennify.com/delivery/home/project-implementation/1-0-initiate",
+                "sitePath": "/home/project-implementation/1-0-initiate",
+                "paraStart": 5412,
+                "paraEnd": 5417,
+            },
+        ],
+    }
+    c = _client(lambda _u, _p: json_response(body))
+    out = await tools.site_mirror_get_url_index(c)
+    assert out["status"] == "ok"
+    assert len(out["pages"]) == 2
+    # name is mapped from pageName
+    assert out["pages"][0]["name"] == "Home"
+    # paragraph_bounds is synthesized
+    assert out["pages"][0]["paragraph_bounds"] == {"start": 5254, "end": 5256}
+    # mirrorDocId never appears anywhere in the serialized output
+    assert MIRROR_DOC_ID not in json.dumps(out)
+
+
+@pytest.mark.asyncio
+async def test_search_sends_q_parameter():
+    """The live API requires `q=`. We send both `q` and `query` for
+    forward-compat with deployments that still use the design-spec name."""
+    captured = {}
+
+    def handler(_url, params):
+        captured.update(params)
+        return json_response(
+            {
+                "results": [
+                    {
+                        "pageName": "Kickoff",
+                        "siteUrl": "https://sites.google.com/zennify.com/delivery/kickoff",
+                        "snippet": "kickoff agenda",
+                    }
+                ]
+            }
+        )
+
+    c = _client(handler)
+    out = await tools.site_mirror_search(c, "kickoff", 5)
+    assert out["status"] == "ok"
+    # Sent the live API's required name
+    assert captured.get("q") == "kickoff"
+    # And also the design-spec name, for back-compat
+    assert captured.get("query") == "kickoff"
+    # Name is mapped from pageName
+    assert out["results"][0]["name"] == "Kickoff"
+
+
+@pytest.mark.asyncio
+async def test_search_handles_apps_script_error_envelope():
+    """Older script versions return {"error": "..."} for bad params."""
+    c = _client(lambda _u, _p: json_response({"error": "Missing required parameter: q"}))
+    out = await tools.site_mirror_search(c, "anything", 5)
+    assert out["status"] == "no_results"
+    assert "Missing required parameter" in out["warning"]

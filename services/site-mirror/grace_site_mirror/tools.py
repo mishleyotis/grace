@@ -9,6 +9,15 @@ Five tools:
 
 Every response is run through ``_scrub_urls`` so the mirror doc ID and Apps
 Script prefix never leak to the Skill / user.
+
+API-compatibility notes (live SiteMirrorQuery web app):
+  - searchSections expects ``q=`` (the design's spec said ``query=``); we
+    send both for forward/back compatibility.
+  - getURLIndex returns ``sections``, not ``pages``; each item has
+    ``pageName`` (we map to ``name``). The response also includes a
+    top-level ``mirrorDocId`` field which is scrubbed before return.
+  - All actions tolerate either the design's response shape or the real
+    one; the tool output is the design's canonical shape.
 """
 
 from __future__ import annotations
@@ -28,9 +37,22 @@ def _safe_str(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _scrub_item_urls(item: dict, *, site_url: str = "") -> dict:
+def _normalize_item(item: dict) -> dict:
+    """Map Apps Script keys to the design's canonical names."""
     out = dict(item)
-    fallback = site_url or _safe_str(item.get("siteUrl"))
+    if "name" not in out and "pageName" in out:
+        out["name"] = out["pageName"]
+    if "paragraph_bounds" not in out and ("paraStart" in out or "paraEnd" in out):
+        out["paragraph_bounds"] = {
+            "start": out.get("paraStart"),
+            "end": out.get("paraEnd"),
+        }
+    return out
+
+
+def _scrub_item_urls(item: dict, *, site_url: str = "") -> dict:
+    out = _normalize_item(item)
+    fallback = site_url or _safe_str(out.get("siteUrl"))
     if "url" in out:
         out["url"] = canonicalize_zennify_url(_safe_str(out.get("url")), fallback)
     if "siteUrl" in out:
@@ -67,6 +89,15 @@ def _scrub_links_list(items: list, *, fallback_site_url: str = "") -> list[dict]
     return out
 
 
+def _pick_array(data: dict, *keys: str) -> list:
+    """Return the first array field present among ``keys``; else []."""
+    for k in keys:
+        v = data.get(k)
+        if isinstance(v, list):
+            return v
+    return []
+
+
 async def site_mirror_get_section(client: AppsScriptClient, name: str) -> dict:
     if not isinstance(name, str) or not name.strip():
         return to_error_dict(ValidationError("name is required"))
@@ -76,15 +107,21 @@ async def site_mirror_get_section(client: AppsScriptClient, name: str) -> dict:
         return to_error_dict(exc)
     if not isinstance(data, dict):
         return to_error_dict(ValidationError("unexpected response shape"))
-    if data.get("status") == "no_results":
+    if data.get("status") == "no_results" or data.get("error"):
         return {"status": "no_results", "name": name}
     site_url = _safe_str(data.get("siteUrl"))
+    content = (
+        _safe_str(data.get("content"))
+        or _safe_str(data.get("text"))
+        or _safe_str(data.get("body"))
+    )
+    paragraphs = data.get("paragraphs") or data.get("paragraphsText") or []
     return {
         "status": "ok",
         "siteUrl": canonicalize_zennify_url(site_url, site_url),
-        "name": _safe_str(data.get("name")) or name,
-        "content": _safe_str(data.get("content")),
-        "paragraphs": data.get("paragraphs") or [],
+        "name": _safe_str(data.get("name")) or _safe_str(data.get("pageName")) or name,
+        "content": content,
+        "paragraphs": paragraphs if isinstance(paragraphs, list) else [],
     }
 
 
@@ -97,13 +134,18 @@ async def site_mirror_search(
     if not isinstance(limit, int) or limit < 1:
         limit = 10
     limit = min(limit, MAX_SEARCH_LIMIT)
+    # Apps Script uses `q`; we send both for compatibility with older deploys.
     try:
-        data = await client.call("searchSections", {"query": query, "limit": limit})
+        data = await client.call(
+            "searchSections", {"q": query, "query": query, "limit": limit}
+        )
     except GraceError as exc:
         return to_error_dict(exc)
-    results_in = data.get("results") if isinstance(data, dict) else None
-    if not isinstance(results_in, list):
-        results_in = []
+    if not isinstance(data, dict):
+        return to_error_dict(ValidationError("unexpected response shape"))
+    if data.get("error"):
+        return {"status": "no_results", "query": query, "warning": _safe_str(data.get("error"))}
+    results_in = _pick_array(data, "results", "matches", "sections", "pages")
     results = _scrub_results_list(results_in)[:limit]
     if not results:
         return {"status": "no_results", "query": query}
@@ -115,9 +157,9 @@ async def site_mirror_get_url_index(client: AppsScriptClient) -> dict:
         data = await client.call("getURLIndex")
     except GraceError as exc:
         return to_error_dict(exc)
-    pages_in = data.get("pages") if isinstance(data, dict) else None
-    if not isinstance(pages_in, list):
-        pages_in = []
+    if not isinstance(data, dict):
+        return to_error_dict(ValidationError("unexpected response shape"))
+    pages_in = _pick_array(data, "sections", "pages")
     pages = _scrub_results_list(pages_in)
     return {"status": "ok", "pages": pages}
 
@@ -127,7 +169,9 @@ async def site_mirror_get_nav_map(client: AppsScriptClient) -> dict:
         data = await client.call("getNavMap")
     except GraceError as exc:
         return to_error_dict(exc)
-    nav = data.get("nav") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return to_error_dict(ValidationError("unexpected response shape"))
+    nav = data.get("nav") or data.get("navMap") or data.get("tree")
     return {"status": "ok", "nav": _scrub_nav(nav)}
 
 
@@ -152,8 +196,8 @@ async def site_mirror_get_page_links(client: AppsScriptClient, page_name: str) -
         data = await client.call("getLinkIndex", {"name": page_name})
     except GraceError as exc:
         return to_error_dict(exc)
-    links_in = data.get("links") if isinstance(data, dict) else None
-    if not isinstance(links_in, list):
-        links_in = []
+    if not isinstance(data, dict):
+        return to_error_dict(ValidationError("unexpected response shape"))
+    links_in = _pick_array(data, "links", "results")
     links = _scrub_links_list(links_in)
     return {"status": "ok", "page_name": page_name, "links": links}
