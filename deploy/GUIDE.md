@@ -407,11 +407,67 @@ done
 
 ## Step 8 — Build + push the 4 Docker images
 
-Run from the **repo root** (`grace-pmo-mcp/`):
+You have two options. **Option A (recommended)** uses Cloud Build, which
+runs on GCP infrastructure — no Cloud Shell resource limits, no flaky
+local docker pushes. Option B is the local `docker build` + `docker push`
+path, kept here for operators on a workstation with enough headroom.
+
+### Option A — Cloud Build (recommended; runs on GCP)
+
+This is the only viable path on Cloud Shell — four back-to-back local
+Python image builds usually OOM-kill the Cloud Shell VM (~1.7 GB RAM,
+small ephemeral disk).
+
+One-time setup:
 
 ```bash
-cd /path/to/grace-pmo-mcp
+cd ~/grace-pmo-mcp
 git pull   # make sure you have the latest site-mirror fixes
+
+# Enable Cloud Build.
+gcloud services enable cloudbuild.googleapis.com --project="$GCP_PROJECT"
+
+# Cloud Build's default SA needs writer on Artifact Registry.
+PROJECT_NUMBER=$(gcloud projects describe "$GCP_PROJECT" --format='value(projectNumber)')
+CLOUDBUILD_SA="${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com"
+gcloud projects add-iam-policy-binding "$GCP_PROJECT" \
+  --member="serviceAccount:${CLOUDBUILD_SA}" \
+  --role="roles/artifactregistry.writer" \
+  --condition=None
+```
+
+Submit the build. `infra/cloudbuild.yaml` builds all 4 images in parallel
+on an `E2_HIGHCPU_8` worker and pushes both `${IMAGE_TAG}` and `:latest`
+to Artifact Registry once every build step succeeds:
+
+```bash
+gcloud builds submit \
+  --config infra/cloudbuild.yaml \
+  --substitutions=_REGISTRY="${REGISTRY}",_TAG="${IMAGE_TAG}" \
+  --project="$GCP_PROJECT" \
+  --region="$GCP_REGION"
+```
+
+Watch progress: the command streams build logs from Cloud Logging until
+all 4 images are pushed (~5–8 min cold; ~2 min with cache).
+
+Verify:
+
+```bash
+for svc in site-mirror sheets slack orchestrator; do
+  echo "=== grace-${svc} ==="
+  gcloud artifacts docker tags list \
+    "${REGISTRY}/grace-${svc}" --project="$GCP_PROJECT" --format='value(TAG)' \
+    | head -3
+done
+# Expect `latest` and `<IMAGE_TAG>` for each service.
+```
+
+### Option B — local `docker build` (workstation with ≥ 4 GB free RAM)
+
+```bash
+cd ~/grace-pmo-mcp
+git pull
 
 for svc in site-mirror sheets slack orchestrator; do
   echo "==== Building grace-${svc}:${IMAGE_TAG} ===="
@@ -437,18 +493,14 @@ for svc in site-mirror sheets slack orchestrator; do
     exit 1
   fi
 done
-```
 
-After the loop, verify all four images landed with both tags:
-
-```bash
+# Verify
 for svc in site-mirror sheets slack orchestrator; do
   echo "=== grace-${svc} ==="
   gcloud artifacts docker tags list \
     "${REGISTRY}/grace-${svc}" --project="$GCP_PROJECT" --format='value(TAG)' \
     | head -3
 done
-# Expect `latest` and `<IMAGE_TAG>` for each service.
 ```
 
 > Each Dockerfile reads `pyproject.toml`, `libs/shared/`, and its own
@@ -842,6 +894,7 @@ gcloud iam service-accounts delete "$RUNTIME_SA" \
 | `grace-site-mirror` returns `upstream_error: request failed` | Apps Script URL wrong or rate-limited | Re-check step 4 |
 | Cloud Run service stuck "Provisioning" | Image tag not in Artifact Registry | Re-run `docker push` from step 8 |
 | `gcloud run deploy` ERROR: `Image '...:<TAG>' not found` | `docker push` failed silently mid-loop (transient `connection refused` to `*-docker.pkg.dev`) | `gcloud artifacts docker tags list ${REGISTRY}/grace-<svc>` to see what's actually there; re-push with the retry loop in step 8; if `:latest` is present but the SHA tag isn't, `docker tag ${REGISTRY}/grace-<svc>:latest ${REGISTRY}/grace-<svc>:${IMAGE_TAG}` then push |
+| Cloud Shell terminal crashes / session disconnects during `docker build` | Cloud Shell VM is OOM-killed by back-to-back Python image builds | Use step 8 **Option A (Cloud Build)** — runs on GCP infrastructure, no Cloud Shell resource use |
 | `gcloud run deploy` fails with `PERMISSION_DENIED` on secret | Runtime SA missing `secretmanager.secretAccessor` | Re-do step 3 |
 | `gcloud run deploy` fails with `iam.serviceAccountUser` denied | Your gcloud principal can't act as `$RUNTIME_SA` | Re-run the `add-iam-policy-binding` at the end of step 3 |
 | Orchestrator returns `error: UpstreamError` for one tier | Tier URL env var missing | `gcloud run services describe grace-orchestrator` and inspect `SITE_MIRROR_URL` / `SHEETS_URL` / `SLACK_URL`; redeploy with `--update-env-vars` if needed |

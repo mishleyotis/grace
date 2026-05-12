@@ -1,0 +1,85 @@
+# Cloud Build pipeline: builds the 4 grace MCP images on Cloud Build and
+# pushes them to Artifact Registry.
+#
+# Submit:
+#   gcloud builds submit --config infra/cloudbuild.yaml \
+#     --substitutions _REGISTRY=$REGISTRY,_TAG=$IMAGE_TAG \
+#     --project=$GCP_PROJECT
+#
+# Substitutions:
+#   _REGISTRY  e.g. us-central1-docker.pkg.dev/digital-maturity-assessor/grace-mcp
+#   _TAG       e.g. 20260512-170000  (also tagged ':latest')
+
+substitutions:
+  _REGISTRY: ""
+  _TAG: "latest"
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1800s
+
+steps:
+  - id: build-site-mirror
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - services/site-mirror/Dockerfile
+      - -t
+      - "${_REGISTRY}/grace-site-mirror:${_TAG}"
+      - -t
+      - "${_REGISTRY}/grace-site-mirror:latest"
+      - .
+    waitFor: ["-"]
+
+  - id: build-sheets
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - services/sheets/Dockerfile
+      - -t
+      - "${_REGISTRY}/grace-sheets:${_TAG}"
+      - -t
+      - "${_REGISTRY}/grace-sheets:latest"
+      - .
+    waitFor: ["-"]
+
+  - id: build-slack
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - services/slack/Dockerfile
+      - -t
+      - "${_REGISTRY}/grace-slack:${_TAG}"
+      - -t
+      - "${_REGISTRY}/grace-slack:latest"
+      - .
+    waitFor: ["-"]
+
+  - id: build-orchestrator
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - services/orchestrator/Dockerfile
+      - -t
+      - "${_REGISTRY}/grace-orchestrator:${_TAG}"
+      - -t
+      - "${_REGISTRY}/grace-orchestrator:latest"
+      - .
+    waitFor: ["-"]
+
+# Cloud Build will push every image listed here once all build steps succeed.
+images:
+  - "${_REGISTRY}/grace-site-mirror:${_TAG}"
+  - "${_REGISTRY}/grace-site-mirror:latest"
+  - "${_REGISTRY}/grace-sheets:${_TAG}"
+  - "${_REGISTRY}/grace-sheets:latest"
+  - "${_REGISTRY}/grace-slack:${_TAG}"
+  - "${_REGISTRY}/grace-slack:latest"
+  - "${_REGISTRY}/grace-orchestrator:${_TAG}"
+  - "${_REGISTRY}/grace-orchestrator:latest"
