@@ -51,13 +51,23 @@ git log -1 --oneline
 
 # -----------------------------------------------------------------------------
 # 2. Verify the routing fix is present in the tree we're about to build.
-#    The marker is: build_app uses mcp.custom_route("/healthz", ...).
-#    If this is missing the deploy WILL 404 on /healthz and we abort early.
+#    The marker is: build_app calls mcp.custom_route(...) for /healthz, /livez,
+#    /_health. If any are missing the deploy WILL 404 and we abort early.
 # -----------------------------------------------------------------------------
-if ! grep -q 'mcp.custom_route("/healthz"' libs/shared/grace_shared/app.py; then
-    fail "libs/shared/grace_shared/app.py is missing the /healthz custom_route fix."
+APP_PY="libs/shared/grace_shared/app.py"
+missing=0
+for path in "/healthz" "/livez" "/_health"; do
+    if ! grep -Fq "\"$path\"" "$APP_PY"; then
+        warn "Routing fix is missing path '$path' in $APP_PY"
+        missing=1
+    fi
+done
+if ! grep -q "custom_route" "$APP_PY"; then
+    warn "Routing fix is missing 'custom_route' call in $APP_PY"
+    missing=1
 fi
-ok "Routing fix is present in libs/shared/grace_shared/app.py"
+[ "$missing" = "1" ] && fail "Abort: $APP_PY does not contain the expected health-route fix."
+ok "Routing fix is present in $APP_PY (registers /healthz, /livez, /_health)"
 
 # -----------------------------------------------------------------------------
 # 3. Cloud Build (parallel, runs on GCP infrastructure).
