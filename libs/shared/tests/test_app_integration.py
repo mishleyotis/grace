@@ -45,6 +45,20 @@ def test_healthz_returns_200_with_service_name(app_with_bearer):
         assert body["service"] == "grace-test"
 
 
+def test_all_three_health_paths_return_200(app_with_bearer):
+    """All three health endpoints work; needed because some GFE configurations
+    intercept the literal ``/healthz`` path."""
+    from starlette.testclient import TestClient
+
+    app, _ = app_with_bearer
+    with TestClient(app) as c:
+        for path in ("/healthz", "/livez", "/_health"):
+            r = c.get(path)
+            assert r.status_code == 200, f"{path} -> {r.status_code}: {r.text[:200]}"
+            assert r.json()["status"] == "ok"
+            assert r.json()["service"] == "grace-test"
+
+
 def test_healthz_does_not_require_bearer(app_with_bearer):
     """The bearer middleware must not gate /healthz."""
     from starlette.testclient import TestClient

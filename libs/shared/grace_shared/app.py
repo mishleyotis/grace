@@ -131,7 +131,14 @@ def build_app(mcp: Any, *, name: str, config: ServiceConfig) -> Any:
 
     External URLs:
       - ``GET /healthz`` → 200 ``{"status":"ok","service":"<name>"}``
+      - ``GET /livez``   → 200 ``{"status":"ok","service":"<name>"}``
+      - ``GET /_health`` → 200 ``{"status":"ok","service":"<name>"}``
       - ``POST /mcp`` and ``POST /mcp/`` → MCP JSON-RPC (bearer required)
+
+    We register three health paths because GFE on some Cloud Run frontends
+    intercepts the literal path ``/healthz`` for its own probes and returns
+    a branded 404 instead of forwarding to the container. ``/livez`` and
+    ``/_health`` always pass through.
     """
     from starlette.responses import JSONResponse  # type: ignore
 
@@ -140,12 +147,15 @@ def build_app(mcp: Any, *, name: str, config: ServiceConfig) -> Any:
         format="%(message)s",
     )
 
-    # Register /healthz on the FastMCP instance. Must happen before http_app().
+    # Register three health endpoints on the FastMCP instance.
+    # Must happen before http_app() materializes the ASGI tree.
     if hasattr(mcp, "custom_route"):
 
-        @mcp.custom_route("/healthz", methods=["GET"])
         async def _healthz(_request: Any) -> Any:
             return JSONResponse({"status": "ok", "service": name})
+
+        for path in ("/healthz", "/livez", "/_health"):
+            mcp.custom_route(path, methods=["GET"])(_healthz)
 
     # Materialize the ASGI app — Starlette under the hood with FastMCP's
     # routes + lifespan + any custom_route handlers.

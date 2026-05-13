@@ -130,27 +130,33 @@ done
 # -----------------------------------------------------------------------------
 # 6. Smoke-test /healthz on every service. Refuse to exit clean unless all 200.
 # -----------------------------------------------------------------------------
-say "Smoke-testing /healthz on the deployed services..."
+say "Smoke-testing the health endpoints on the deployed services..."
+say "  trying /healthz, /livez, /_health — at least one must return 200"
 ALL_OK=1
 for svc in grace-site-mirror grace-sheets grace-slack grace-orchestrator; do
     url=$(gcloud run services describe "$svc" \
         --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
         --format='value(status.url)')
-    # Retry a few times — first request often pays cold-start cost.
-    code=000
-    for attempt in 1 2 3 4 5; do
-        code=$(curl -sSL --max-time 30 -o /tmp/redeploy_body \
-            -w "%{http_code}" "${url}/healthz" || echo 000)
-        [ "$code" = "200" ] && break
-        sleep 3
+    found=""
+    for path in /healthz /livez /_health; do
+        for attempt in 1 2 3; do
+            code=$(curl -sSL --max-time 30 -o /tmp/redeploy_body \
+                -w "%{http_code}" "${url}${path}" || echo 000)
+            if [ "$code" = "200" ] && grep -q "\"service\":\"${svc}\"" /tmp/redeploy_body 2>/dev/null; then
+                found="$path"
+                break
+            fi
+            sleep 2
+        done
+        [ -n "$found" ] && break
     done
-    body=$(head -c 200 /tmp/redeploy_body 2>/dev/null || true)
-    if [ "$code" = "200" ] && grep -q "\"service\":\"${svc}\"" /tmp/redeploy_body 2>/dev/null; then
-        ok "${svc}/healthz → 200 ${body}"
+    if [ -n "$found" ]; then
+        body=$(head -c 200 /tmp/redeploy_body 2>/dev/null || true)
+        ok "${svc}${found} → 200  ${body}"
     else
         ALL_OK=0
-        warn "${svc}/healthz → HTTP $code"
-        warn "  body: ${body}"
+        warn "${svc} — none of /healthz /livez /_health returned 200"
+        warn "  last body: $(head -c 200 /tmp/redeploy_body 2>/dev/null)"
     fi
 done
 
